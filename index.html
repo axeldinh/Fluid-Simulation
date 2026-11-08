@@ -18,6 +18,19 @@
     border-radius: 999px; padding: 9px 14px; white-space: nowrap; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
   #hud button:active { background: #ffffff40; }
   #stats { margin-left: auto; white-space: nowrap; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
+  #panel { position: fixed; left: 0; right: 0; bottom: 0; max-height: 62vh; overflow-y: auto; display: none;
+    padding: 14px calc(16px + env(safe-area-inset-right)) calc(64px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
+    background: #000000c4; backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border-top: 1px solid #ffffff22;
+    font: 13px/1.2 system-ui, sans-serif; color: #fffd; touch-action: pan-y; box-sizing: border-box; }
+  #panel.open { display: block; }
+  #panel.open ~ #hud #stats, body.panel #stats { display: none; }
+  body.panel #hud { background: linear-gradient(#0000, #000c 60%); }
+  #panel .row { display: grid; grid-template-columns: 1fr auto; gap: 4px 10px; margin-bottom: 14px; }
+  #panel .row output { color: #fff9; font-variant-numeric: tabular-nums; }
+  #panel input[type=range] { grid-column: 1 / -1; width: 100%; margin: 0; height: 28px; }
+  #panel .row.check { grid-template-columns: auto 1fr; align-items: center; }
+  #panel button { font: inherit; color: #fffc; background: #ffffff1f; border: 1px solid #ffffff2e; border-radius: 999px; padding: 9px 14px; }
+  #hud { z-index: 2; }
   #msg { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
     color: #fff; font: 16px/1.4 system-ui, sans-serif; text-align: center; white-space: pre-wrap; }
 </style>
@@ -28,8 +41,10 @@
   <button id="clear">Clear</button>
   <button id="motion" hidden>Tilt: off</button>
   <button id="swirl">Swirl: on</button>
+  <button id="gear">Settings</button>
   <div id="stats"></div>
 </div>
+<div id="panel"></div>
 <div id="msg"></div>
 <script>
 'use strict';
@@ -64,6 +79,7 @@ const LEVELS = [
 ];
 const cfg = {
   level: 2,
+  auto: true,
   densityDissipation: 0.6,
   velocityDissipation: 0.25,
   pressure: 0.8,
@@ -422,17 +438,66 @@ $('swirl').onclick = e => { cfg.swirl = !cfg.swirl; e.target.textContent = 'Swir
 
 window.addEventListener('resize', () => { if (resizeCanvas()) initBuffers(); });
 
+// ----- settings panel --------------------------------------------------------
+const SCHEMA = [
+  { k: 'curl', label: 'Swirliness (vorticity)', min: 0, max: 60, step: 1 },
+  { k: 'velocityDissipation', label: 'Velocity damping', min: 0, max: 4, step: 0.05 },
+  { k: 'densityDissipation', label: 'Dye fade', min: 0, max: 4, step: 0.05 },
+  { k: 'pressure', label: 'Pressure persistence', min: 0, max: 1, step: 0.01 },
+  { k: 'splatRadius', label: 'Brush size', min: 0.05, max: 1, step: 0.01 },
+  { k: 'splatForce', label: 'Stir force', min: 500, max: 20000, step: 100 },
+  { k: 'dyeIntensity', label: 'Dye amount', min: 0.02, max: 0.6, step: 0.01 },
+  { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
+];
+const DEFAULTS = Object.assign({}, cfg);
+const KEY = 'fluidCfg';
+try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
+resizeCanvas(); initBuffers();
+const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
+const panel = $('panel'), widgets = {};
+function addRow(html) { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = html; panel.appendChild(d); return d; }
+for (const s of SCHEMA) {
+  const row = addRow(`<label>${s.label}</label><output></output><input type="range" min="${s.min}" max="${s.max}" step="${s.step}">`);
+  const inp = row.querySelector('input'), out = row.querySelector('output');
+  const show = () => { inp.value = cfg[s.k]; out.textContent = +(+cfg[s.k]).toFixed(2); };
+  inp.oninput = () => { cfg[s.k] = +inp.value; out.textContent = +(+inp.value).toFixed(2); if (!s.apply) save(); };
+  if (s.apply) inp.onchange = () => { s.apply(); save(); };
+  widgets[s.k] = show; show();
+}
+{
+  const r = addRow(`<label>Resolution level</label><output></output><input type="range" min="0" max="${LEVELS.length - 1}" step="1">`);
+  const inp = r.querySelector('input'), out = r.querySelector('output');
+  const show = () => { inp.value = cfg.level; const L = LEVELS[cfg.level]; out.textContent = `${cfg.level} (sim ${L.sim}, dye ${L.dye})`; };
+  inp.oninput = () => { cfg.level = +inp.value; perf.ceiling = LEVELS.length - 1; show(); };
+  inp.onchange = () => { initBuffers(); save(); };
+  widgets.level = show; show();
+  const c = document.createElement('div'); c.className = 'row check';
+  c.innerHTML = `<input type="checkbox" id="auto"><label for="auto">Auto-adjust resolution to keep 60 fps</label>`;
+  panel.appendChild(c);
+  const cb = c.querySelector('input'); cb.checked = cfg.auto;
+  cb.onchange = () => { cfg.auto = cb.checked; perf.goodSecs = 0; save(); };
+}
+{
+  const b = document.createElement('button'); b.textContent = 'Reset to defaults';
+  b.onclick = () => { Object.assign(cfg, DEFAULTS); perf.ceiling = LEVELS.length - 1; resizeCanvas(); initBuffers();
+    for (const k in widgets) widgets[k](); panel.querySelector('#auto').checked = cfg.auto; save(); };
+  panel.appendChild(b);
+}
+$('gear').onclick = () => { document.body.classList.toggle('panel', panel.classList.toggle('open')); };
+
 // ----- adaptive quality ----------------------------------------------------
 const perf = { frames: 0, acc: 0, fps: 60, goodSecs: 0, ceiling: LEVELS.length - 1 };
 function adapt(rawDt) {
   perf.frames++; perf.acc += rawDt;
   if (perf.acc < 1) return;               // evaluate once per second
   perf.fps = perf.frames / perf.acc; perf.frames = 0; perf.acc = 0;
-  if (perf.fps < 40 && cfg.level > 0) {
+  if (!cfg.auto) {}
+  else if (perf.fps < 40 && cfg.level > 0) {
     cfg.level--; perf.ceiling = cfg.level; perf.goodSecs = 0; initBuffers();   // never climb back above a level that failed
   } else if (perf.fps > 55 && cfg.level < perf.ceiling) {
     if (++perf.goodSecs >= 3) { cfg.level++; perf.goodSecs = 0; initBuffers(); }
   } else perf.goodSecs = 0;
+  if (widgets.level) widgets.level();
   const L = LEVELS[cfg.level];
   $('stats').textContent = `${Math.round(perf.fps)} fps · sim ${L.sim} · dye ${L.dye}`;
 }
