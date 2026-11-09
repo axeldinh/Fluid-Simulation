@@ -83,7 +83,7 @@ const LEVELS = [
 // (an advected 0..1 fill fraction on a staggered grid with a two-phase pressure solve) that gravity pulls down and that you can slosh, stir, and grow new blobs of.
 const PRESETS = {
   dye:   { velocityDissipation: 0.25, densityDissipation: 0.6, pressure: 0.8,  curl: 25, splatRadius: 0.22, splatForce: 6000, dyeIntensity: 0.18 },
-  water: { velocityDissipation: 0.02, densityDissipation: 0.5, pressure: 0.9,  curl: 0,  splatRadius: 0.4,  splatForce: 3000, dyeIntensity: 0.18 },
+  water: { velocityDissipation: 2, densityDissipation: 0.5, pressure: 0.9,  curl: 0,  splatRadius: 0.4,  splatForce: 3000, dyeIntensity: 0.18 },
 };
 const cfg = {
   mode: 'water',
@@ -96,7 +96,7 @@ const cfg = {
   waterAlgo: 'grid',  // 'grid' = Eulerian two-phase solver on the GPU, 'flip' = FLIP particles (CPU)
   flipRatio: 0.9,     // FLIP: 0 = pure PIC (smooth, damped), 1 = pure FLIP (lively, noisier)
   flipIters: 40,      // FLIP: pressure solver sweeps per step
-  density: 800,       // water mode: water density relative to air (real water ≈ 800)
+  density: 100,       // water mode: water density relative to air (real water ≈ 800; 100 stays calmer)
   swirl: true,
   tiltStrength: 1,    // multiplier for device-tilt gravity
   maxDpr: 1.5,
@@ -1191,7 +1191,7 @@ const SCHEMA = [
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg5';
+const KEY = 'fluidCfg6';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
