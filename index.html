@@ -88,7 +88,6 @@ const cfg = {
   splatForce: 3000,
   gravity: 30,        // water mode: screen heights per second² (≈ Earth gravity for a 30 cm tank)
   ballGrowth: 0.25,   // water mode: how fast a held-down water ball grows (screen heights per second)
-  sharpen: 1.0,       // grid water: interface contrast boost per frame (only applied where water moves fast). Anything above 1.0 made the resting pool slowly start to boil in tests, so it stays off
   waterAlgo: 'grid',  // 'grid' = Eulerian two-phase solver on the GPU, 'flip' = FLIP particles (CPU), 'apic' = APIC + PCG + ghost-fluid particles (CPU)
   flipRatio: 0.9,     // FLIP: 0 = pure PIC (smooth, damped), 1 = pure FLIP (lively, noisier)
   flipIters: 40,      // FLIP: pressure solver sweeps per step (APIC Pro: maximum conjugate-gradient iterations)
@@ -150,48 +149,58 @@ const FRAG = {
       o = vec4(c, 1.0 - abs(2.0 * c - 1.0), 0.0, 1.0);
     }`,
 
-  // Keeps the water surface crisp and holds the water volume constant: the mean fill (uMass,
-  // last mip level) is compared with the target and the surface is nudged out/in just enough
-  // to cancel the numerical volume loss/gain of advection.
-  sharpen: HEAD + VELSRC + `uniform sampler2D uTex, uMass; uniform float k, target, gain;
-    void main(){
-      float c = clamp(texture(uTex, vUv).x, 0.0, 1.0);
-      vec2 m = textureLod(uMass, vec2(0.5), 7.0).xy;
-      vec2 ts = vec2(vR.x - vUv.x, vT.y - vUv.y);
-      float cb = 0.0;                                     // 3x3 blur -> a band a couple of texels wide around the surface
-      for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++)
-        cb += clamp(texture(uTex, vUv + vec2(float(i), float(j)) * ts).x, 0.0, 1.0);
-      float band = 1.0 - abs(2.0 * (cb / 9.0) - 1.0);
-      float err = target - m.x; err = abs(err) < 0.004 ? 0.0 : err - sign(err) * 0.004;   // dead band: don't make a resting surface breathe
-      float delta = clamp(err * gain / max(m.y, 0.02), -0.3, 0.3);
-      // only sharpen where the water is actually moving: at rest, sharpening amplifies tiny wobbles into a boil
-      float sp = length(velAt(vUv * gridSize)) / gridSize.y;
-      float kk = 1.0 + (k - 1.0) * smoothstep(0.15, 0.6, sp);
-      o = vec4(clamp((c - 0.5) * kk + 0.5 + delta * band, 0.0, 1.0), 0.0, 0.0, 1.0);
-    }`,
-
-  // Stamp a solid ball of water (fill fraction -> 1) into the water field.
-  stampPhi: HEAD + `uniform sampler2D uTex; uniform vec2 point; uniform float aspect, radius;
-    void main(){
-      vec2 d = vUv - point; d.x *= aspect;
-      float inside = 1.0 - smoothstep(radius - 0.006, radius, length(d));
-      vec4 t = texture(uTex, vUv);
-      o = vec4(mix(t.x, 1.0, inside), t.yzw);
-    }`,
-
   phiClamp: HEAD + `uniform sampler2D uTex;
     void main(){ o = vec4(clamp(texture(uTex, vUv).x, 0.0, 1.0), 0.0, 0.0, 1.0); }`,
 
-  fill: HEAD + `void main(){ o = vec4(1.0 - smoothstep(0.39, 0.41, vUv.y), 0.0, 0.0, 1.0); }`,
-
   // ===== Water: staggered (MAC) grid + two-phase pressure projection =====
   // u lives on vertical cell faces, v on horizontal ones, pressure and the fill fraction in cells.
-  phiDown: HEAD + `uniform sampler2D uWater; uniform vec2 cell;
+  // ===== Grid surface: a level set psi = signed distance to the water surface, in screen heights (< 0 inside) =====
+  // Advected with MacCormack (second-order, with a limiter), kept a distance function by PDE re-initialisation,
+  // and turned into a fill fraction with a smooth step only when needed: a crisp surface that doesn't smear.
+  fillLS: HEAD + `uniform float band, level;
+    void main(){ o = vec4(clamp(vUv.y - level, -band, band), 0.0, 0.0, 1.0); }`,
+  stampLS: HEAD + `uniform sampler2D uTex; uniform vec2 point; uniform float aspect, radius;
+    void main(){ vec2 d = vUv - point; d.x *= aspect; o = vec4(min(texture(uTex, vUv).x, length(d) - radius), 0.0, 0.0, 1.0); }`,
+  lsToFill: HEAD + `uniform sampler2D uTex; uniform float eps;
+    void main(){ o = vec4(1.0 - smoothstep(-eps, eps, texture(uTex, vUv).x), 0.0, 0.0, 1.0); }`,
+  // fill fraction per simulation cell (for the densities), with the surface smoothed over about two cells
+  phiDown: HEAD + `uniform sampler2D uPsi; uniform vec2 cell; uniform float eps;
     void main(){
       float s = 0.0;
       for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++)
-        s += clamp(textureLod(uWater, vUv + vec2(float(i), float(j)) * cell * 0.33, 0.0).x, 0.0, 1.0);
+        s += 1.0 - smoothstep(-eps, eps, textureLod(uPsi, vUv + vec2(float(i), float(j)) * cell * 0.33, 0.0).x);
       o = vec4(s / 9.0, 0.0, 0.0, 1.0);
+    }`,
+  // MacCormack: forward + backward semi-Lagrangian steps give an error estimate that is subtracted, then the result is
+  // clamped to the values it was interpolated from (no new extrema). The volume error measured last frame is fixed by
+  // moving the whole surface along its normal (with a distance function that is just a constant shift).
+  maccormack: HEAD + VELSRC + `uniform sampler2D uPsi, uFwd, uBack, uMass; uniform float dt, target, band, maxShift; uniform vec2 texSize;
+    void main(){
+      vec2 p = vUv * gridSize;
+      vec2 pm = clamp(p - 0.5 * dt * velAt(p), vec2(0.0), gridSize);
+      vec2 p0 = clamp(p - dt * velAt(pm), vec2(0.0), gridSize);
+      float c = texture(uFwd, vUv).x + 0.5 * (texture(uPsi, vUv).x - texture(uBack, vUv).x);
+      vec2 t = p0 / gridSize * texSize - 0.5; ivec2 i0 = ivec2(floor(t)), mx = ivec2(texSize) - 1;
+      float a = texelFetch(uPsi, clamp(i0, ivec2(0), mx), 0).x, b = texelFetch(uPsi, clamp(i0 + ivec2(1, 0), ivec2(0), mx), 0).x;
+      float e = texelFetch(uPsi, clamp(i0 + ivec2(0, 1), ivec2(0), mx), 0).x, d = texelFetch(uPsi, clamp(i0 + ivec2(1, 1), ivec2(0), mx), 0).x;
+      c = clamp(c, min(min(a, b), min(e, d)), max(max(a, b), max(e, d)));
+      vec2 m = textureLod(uMass, vec2(0.5), 7.0).xy;
+      float err = target - m.x; err = abs(err) < 0.001 ? 0.0 : err - sign(err) * 0.001;
+      float shift = clamp(0.5 * err * (0.5 / 128.0) / max(m.y, 1e-4), -maxShift, maxShift);
+      o = vec4(clamp(c - shift, -band, band), 0.0, 0.0, 1.0);
+    }`,
+  // one step of  psi_t + sign(psi0) (|grad psi| - 1) = 0  (Godunov upwinding) keeps psi a signed distance
+  redistance: HEAD + `uniform sampler2D uPsi, uPsi0; uniform vec2 h; uniform float band;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uPsi, 0) - 1;
+      float p = texelFetch(uPsi, c, 0).x, p0 = texelFetch(uPsi0, c, 0).x;
+      float L = texelFetch(uPsi, clamp(c - ivec2(1, 0), ivec2(0), n), 0).x, R = texelFetch(uPsi, clamp(c + ivec2(1, 0), ivec2(0), n), 0).x;
+      float B = texelFetch(uPsi, clamp(c - ivec2(0, 1), ivec2(0), n), 0).x, T = texelFetch(uPsi, clamp(c + ivec2(0, 1), ivec2(0), n), 0).x;
+      float a = (p - L) / h.x, b = (R - p) / h.x, e = (p - B) / h.y, d = (T - p) / h.y, gx, gy;
+      if (p0 > 0.0) { gx = max(max(a, 0.0) * max(a, 0.0), min(b, 0.0) * min(b, 0.0)); gy = max(max(e, 0.0) * max(e, 0.0), min(d, 0.0) * min(d, 0.0)); }
+      else          { gx = max(min(a, 0.0) * min(a, 0.0), max(b, 0.0) * max(b, 0.0)); gy = max(min(e, 0.0) * min(e, 0.0), max(d, 0.0) * max(d, 0.0)); }
+      float hm = min(h.x, h.y), s = p0 / sqrt(p0 * p0 + hm * hm);
+      o = vec4(clamp(p - 0.5 * hm * s * (sqrt(gx + gy) - 1.0), -band, band), 0.0, 0.0, 1.0);
     }`,
 
   // Face coefficients beta = 1/density between neighbouring cells (0 at solid walls).
@@ -449,14 +458,15 @@ let texUnit = 0;
 function bindTex(loc, fb) { gl.activeTexture(gl.TEXTURE0 + texUnit); gl.bindTexture(gl.TEXTURE_2D, fb.tex); gl.uniform1i(loc, texUnit++); }
 
 // ----- framebuffers --------------------------------------------------------
-function makeFBO(w, h, filter, mips = false, f32 = false) {
+function makeFBO(w, h, filter, mips = false, f32 = false, r16 = false) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mips ? gl.LINEAR_MIPMAP_NEAREST : filter);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  if (f32) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+  if (r16) gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, w, h, 0, gl.RED, gl.HALF_FLOAT, null);
+  else if (f32) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
   else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
   const fbo = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
@@ -467,15 +477,15 @@ function makeFBO(w, h, filter, mips = false, f32 = false) {
   return { tex, fbo, w, h, texel: [1 / w, 1 / h], destroy() { gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); } };
 }
 function genMips(fb) { gl.bindTexture(gl.TEXTURE_2D, fb.tex); gl.generateMipmap(gl.TEXTURE_2D); }
-function makeDouble(w, h, filter, mips = false, f32 = false) {
-  const d = { read: makeFBO(w, h, filter, mips, f32), write: makeFBO(w, h, filter, mips, f32),
+function makeDouble(w, h, filter, mips = false, f32 = false, r16 = false) {
+  const d = { read: makeFBO(w, h, filter, mips, f32, r16), write: makeFBO(w, h, filter, mips, f32, r16),
     swap() { const t = this.read; this.read = this.write; this.write = t; },
     destroy() { this.read.destroy(); this.write.destroy(); } };
   return d;
 }
 // Resample an existing double buffer into new dimensions (used when quality changes).
-function resizeDouble(old, w, h, filter, mips = false) {
-  const n = makeDouble(w, h, filter, mips);
+function resizeDouble(old, w, h, filter, mips = false, f32 = false, r16 = false) {
+  const n = makeDouble(w, h, filter, mips, f32, r16);
   if (old) {
     texUnit = 0; const u = use(P.copy); bindTex(u.uTex, old.read); blit(n.read);
     old.destroy();
@@ -483,7 +493,7 @@ function resizeDouble(old, w, h, filter, mips = false) {
   return n;
 }
 
-let water, massTex;
+let water, massTex, lset, lsF, lsB, ls0;          // lset: the grid solver's level set (psi), plus scratch fields for advection / re-initialisation
 function gridSize(res) {
   let a = canvas.width / canvas.height; if (a < 1) a = 1 / a;
   const lo = Math.round(res), hi = Math.round(res * a);
@@ -494,6 +504,9 @@ function initBuffers() {
   const [sw, sh] = gridSize(L.sim), [dw, dh] = gridSize(L.tex);
   const fresh = !water;
   water = resizeDouble(water, dw, dh, gl.LINEAR);
+  lset = resizeDouble(lset, dw, dh, gl.LINEAR, false, false, true);     // psi is stored in screen heights, so it survives a resolution change
+  [lsF, lsB, ls0].forEach(f => f && f.destroy());
+  lsF = makeFBO(dw, dh, gl.LINEAR, false, false, true); lsB = makeFBO(dw, dh, gl.LINEAR, false, false, true); ls0 = makeFBO(dw, dh, gl.NEAREST, false, false, true);
   if (!massTex) massTex = makeFBO(128, 128, gl.LINEAR, true);
   if (fresh) fillWater();
   buildWater(sw, sh);
@@ -549,8 +562,15 @@ function resizeCanvas() {
 }
 const FILL_LEVEL = 0.4;        // fraction of the tank filled at start (matches the 'fill' shader)
 let waterTarget = FILL_LEVEL;  // the water volume the solver keeps constant (re-measured when you drop a ball)
+const LS_BAND = 0.06;           // psi is clamped to +-this many screen heights (only the region near the surface matters)
+function lsRefresh() {         // psi -> fill fraction (for drawing and for measuring the volume)
+  texUnit = 0; const u = use(P.lsToFill); bindTex(u.uTex, lset.read); gl.uniform1f(u.eps, 1.5 / lset.read.h); blit(water.write); water.swap();
+  texUnit = 0; use(P.massDown); bindTex(P.massDown.u.uTex, water.read); blit(massTex);
+  gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
+}
 function fillWater() {
-  texUnit = 0; use(P.fill); blit(water.read);
+  const u = use(P.fillLS); gl.uniform1f(u.band, LS_BAND); gl.uniform1f(u.level, FILL_LEVEL); blit(lset.read);
+  lsRefresh();
   waterTarget = FILL_LEVEL;
 }
 resizeCanvas(); initBuffers();
@@ -1023,7 +1043,7 @@ function stepWater(dt) {
   const [W, H] = WS.grid, L0 = WS.lv[0];
   let u;
   // fill fraction at simulation resolution
-  texUnit = 0; u = use(P.phiDown); bindTex(u.uWater, water.read); gl.uniform2f(u.cell, 1 / W, 1 / H); blit(WS.phi);
+  texUnit = 0; u = use(P.phiDown); bindTex(u.uPsi, lset.read); gl.uniform2f(u.cell, 1 / W, 1 / H); gl.uniform1f(u.eps, 2 / H); blit(WS.phi);   // +-2 cells: a 1-cell transition went unstable when the frame time varies
 
   // advect the face velocities (both read the old fields, then swap)
   for (const kind of [0, 1]) {
@@ -1045,7 +1065,10 @@ function stepWater(dt) {
   texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.rhoA, 1 / Math.min(cfg.density, CAN_F32 ? 2000 : 30)); blit(L0.b);
   for (let l = 0; l + 1 < WS.lv.length; l++) { texUnit = 0; u = use(P.restrictBetaW); bindTex(u.uB, WS.lv[l].b); blit(WS.lv[l + 1].b); }
   texUnit = 0; u = use(P.divMAC); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); blit(L0.d);
-  texUnit = 0; u = use(P.clear); bindTex(u.uTex, L0.p.read); gl.uniform1f(u.value, cfg.pressure); blit(L0.p.write); L0.p.swap();
+  // warm start from last step's pressure, rescaled for the time step (hydrostatic pressure here is proportional to dt;
+  // without the rescale a frame-time hiccup hands the solver a wrong guess and the surface gets a kick)
+  const wsc = WS.lastDt ? dt / WS.lastDt : 1; WS.lastDt = dt;
+  texUnit = 0; u = use(P.clear); bindTex(u.uTex, L0.p.read); gl.uniform1f(u.value, cfg.pressure * wsc); blit(L0.p.write); L0.p.swap();
   // heavier water (bigger density jump between water and air) needs more V-cycles to settle hydrostatic pressure
   const cycles = cfg.density > 200 ? 4 : cfg.density > 40 ? 3 : 2;
   for (let i = 0; i < cycles; i++) wvcycle(0, 3, 3);
@@ -1053,18 +1076,24 @@ function stepWater(dt) {
   texUnit = 0; u = use(P.projectV); bindTex(u.uV, WS.V.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.airCap, 3 * H); blit(WS.V.write);
   WS.U.swap(); WS.V.swap();
 
-  // move the water with the new velocity
-  texUnit = 0; u = use(P.advectPhi); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); bindTex(u.uSource, water.read);
-  gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, dt); blit(water.write); water.swap();
-  // advection smears the surface and loses volume; re-sharpen and re-balance the volume.
-  // First measure the current volume: downsample into a 128x128 power-of-two texture whose
-  // mip chain's last level is then exactly the mean (no CPU readback).
-  texUnit = 0; u = use(P.massDown); bindTex(u.uTex, water.read); blit(massTex);
-  gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
-  texUnit = 0; u = use(P.sharpen, water.read.texel); bindTex(u.uTex, water.read); bindTex(u.uMass, massTex);
-  bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); gl.uniform2f(u.gridSize, W, H);
-  gl.uniform1f(u.k, cfg.sharpen); gl.uniform1f(u.target, waterTarget); gl.uniform1f(u.gain, 0.3);
-  blit(water.write); water.swap();
+  // move the surface with the new velocity: MacCormack advection of psi, then re-initialisation
+  const T = lset.read, texSize = [T.w, T.h];
+  for (const [src, dst, sdt] of [[lset.read, lsF, dt], [lsF, lsB, -dt]]) {
+    texUnit = 0; u = use(P.advectPhi); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); bindTex(u.uSource, src);
+    gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, sdt); blit(dst);
+  }
+  texUnit = 0; u = use(P.maccormack); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read);
+  bindTex(u.uPsi, lset.read); bindTex(u.uFwd, lsF); bindTex(u.uBack, lsB); bindTex(u.uMass, massTex);
+  gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, dt); gl.uniform2f(u.texSize, texSize[0], texSize[1]);
+  gl.uniform1f(u.target, waterTarget); gl.uniform1f(u.band, LS_BAND); gl.uniform1f(u.maxShift, 0.3 / T.h);
+  blit(lset.write); lset.swap();
+  texUnit = 0; u = use(P.copy); bindTex(u.uTex, lset.read); blit(ls0);
+  const aspect = canvas.width / canvas.height;
+  for (let i = 0; i < 2; i++) {
+    texUnit = 0; u = use(P.redistance); bindTex(u.uPsi, lset.read); bindTex(u.uPsi0, ls0);
+    gl.uniform2f(u.h, aspect / T.w, 1 / T.h); gl.uniform1f(u.band, LS_BAND); blit(lset.write); lset.swap();
+  }
+  lsRefresh();
 }
 
 function render() {
@@ -1083,9 +1112,9 @@ function render() {
 function stampBall(x, y, r) {
   if (isParticles()) { const f = FL.sim; f.stamp(1 + x * f.nx, 1 + y * f.ny, r * f.ny); return; }
   const aspect = canvas.width / canvas.height, [W, H] = WS.grid;
-  texUnit = 0; let u = use(P.stampPhi); bindTex(u.uTex, water.read);
+  texUnit = 0; let u = use(P.stampLS); bindTex(u.uTex, lset.read);
   gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect); gl.uniform1f(u.radius, r);
-  blit(water.write); water.swap();
+  blit(lset.write); lset.swap(); lsRefresh();
   for (const [kind, T] of [[0, WS.U], [1, WS.V]]) {           // a freshly made ball starts at rest
     texUnit = 0; u = use(P.splatFaces); bindTex(u.uTex, T.read);
     gl.uniform2f(u.gridSize, W, H); gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect);
@@ -1213,7 +1242,7 @@ const SCHEMA = [
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg7';
+const KEY = 'fluidCfg8';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
