@@ -172,8 +172,10 @@ const FRAG = {
       o = vec4(c, 1.0 - abs(2.0 * c - 1.0), 0.0, 1.0);
     }`,
 
+  // particle density -> fill fraction. The surface stays at density 0.5; small gaps between particles inside the
+  // water (density dips to ~0.7) still count as full water instead of showing up as a mottled texture.
   phiClamp: HEAD + `uniform sampler2D uTex;
-    void main(){ o = vec4(clamp(texture(uTex, vUv).x, 0.0, 1.0), 0.0, 0.0, 1.0); }`,
+    void main(){ o = vec4(smoothstep(0.3, 0.7, texture(uTex, vUv).x), 0.0, 0.0, 1.0); }`,
 
   // ===== Water: staggered (MAC) grid + two-phase pressure projection =====
   // u lives on vertical cell faces, v on horizontal ones, pressure and the fill fraction in cells.
