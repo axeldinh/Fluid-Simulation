@@ -824,7 +824,7 @@ function stepFlip(dt) {
   const SIGMA = 0.55, cellPx = FL.dens.w / nx;
   gl.useProgram(P.particles.p);
   gl.uniform1f(P.particles.u.size, Math.max(2, 6 * SIGMA * cellPx));
-  gl.uniform1f(P.particles.u.weight, 1 / (f.rest > 0 ? 1.6 * 2 * Math.PI * SIGMA * SIGMA * 3.2 / 3.2 * 1.0 : 6.1));   // ~1 inside the water
+  gl.uniform1f(P.particles.u.weight, 1 / ((f.rest > 0 ? f.rest : 3.2) * 2 * Math.PI * SIGMA * SIGMA));   // density = 1 inside the water, 0.5 at the surface
   gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
   gl.bindVertexArray(FL.vao); gl.drawArrays(gl.POINTS, 0, f.np); gl.bindVertexArray(null);
   gl.disable(gl.BLEND);
@@ -1269,9 +1269,17 @@ function floorPressure(algo, dt) {                 // pressure at the bottom min
   for (let x = 2; x < L.w - 2; x++) { bot += a[x * 4]; top += a[((L.h - 1) * L.w + x) * 4]; c++; }
   return { value: (bot - top) / c, dt, g: cfg.gravity * L.h, cells: L.h };
 }
-function periodFromSeries(eta, dt) {               // mean spacing of zero crossings x 2
-  const mean = avg(eta), x = eta.map(v => v - mean), cr = [];
-  for (let i = 1; i < x.length; i++) if (x[i - 1] * x[i] < 0) cr.push(i - 1 + x[i - 1] / (x[i - 1] - x[i]));
+function periodFromSeries(eta, dt) {               // mean spacing of zero crossings x 2, ignoring noise once the swing has died down
+  const mean = avg(eta), x = eta.map(v => v - mean);
+  const thr = 0.2 * Math.max(...x.slice(0, 60).map(Math.abs)), cr = [];
+  let state = 0;                                    // Schmitt trigger: only count a crossing when the signal clearly reaches the other side
+  for (let i = 1; i < x.length; i++) {
+    const s = x[i] > thr ? 1 : x[i] < -thr ? -1 : 0;
+    if (s !== 0 && s !== state) {
+      if (state !== 0) { let j = i; while (j > 0 && Math.sign(x[j - 1]) === s) j--; cr.push(j - 1 + x[j - 1] / (x[j - 1] - x[j])); }
+      state = s;
+    }
+  }
   if (cr.length < 3) return null;
   return 2 * (cr[cr.length - 1] - cr[0]) / (cr.length - 1) * dt;
 }
