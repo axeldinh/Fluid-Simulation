@@ -727,7 +727,9 @@ class Flip {
       this.aV[i * fY + j] = (j >= 2 && j <= fY - 2 && i >= 1 && i <= fX - 2) ? 1 : 0;
     }
     this.paddleX = -1; this.paddleU = 0; this._padWas = false; this.jet = null;
-    this.cutCells = !!window.CUT; this.fineSDF = !!window.FINESDF;                     // particles: whole-cell solids by default (cut cells made them churn next to obstacles)
+    // particles: whole-cell solids in the pressure solve (cut cells made them churn next to obstacles in tests), but
+    // collisions against the full-resolution obstacle shape (calmer than cell-based collisions, and true to the outline)
+    this.cutCells = !!window.CUT; this.fineSDF = window.FINESDF !== false;
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
     this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
     this.hCount = new Int32Array(this.hx * this.hy); this.hFirst = new Int32Array(this.hx * this.hy + 1);
