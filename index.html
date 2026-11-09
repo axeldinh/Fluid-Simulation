@@ -17,6 +17,8 @@
   #hud button { pointer-events: auto; font: inherit; color: #fffc; background: #ffffff1f; border: 1px solid #ffffff2e;
     border-radius: 999px; padding: 9px 14px; white-space: nowrap; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
   #hud button:active { background: #ffffff40; }
+  #hud a { pointer-events: auto; font: inherit; color: #fffc; background: #ffffff1f; border: 1px solid #ffffff2e; text-decoration: none;
+    border-radius: 999px; padding: 9px 14px; white-space: nowrap; }
   #stats { margin-left: auto; white-space: nowrap; font-size: 11px; font-variant-numeric: tabular-nums; text-align: right; }
   #panel { position: fixed; left: 0; right: 0; bottom: 0; max-height: 62vh; overflow-y: auto; display: none;
     padding: 14px calc(16px + env(safe-area-inset-right)) calc(64px + env(safe-area-inset-bottom)) calc(16px + env(safe-area-inset-left));
@@ -51,6 +53,7 @@
   <button id="tap">Tap: off</button>
   <button id="motion" hidden>Tilt: off</button>
   <button id="gear">Settings</button>
+  <a id="to3d" href="3d.html">3D</a>
   <div id="stats"></div>
 </div>
 <div id="scenes"></div>
@@ -243,23 +246,28 @@ const FRAG = {
     }`,
 
   // Face coefficients beta = 1/density between neighbouring cells (0 at solid walls).
-  beta: HEAD + `uniform sampler2D uPhi, uSolid; uniform float rhoA, paddleX;     // water density = 1, air density = rhoA (= 1 / ratio)
+  // Cut cells (Batty et al. 2007): each face is weighted by its open fraction (the part not inside an obstacle),
+  // so water feels the real slope of a beach or the real outline of a rock instead of a staircase.
+  // xy = coefficient of the right / top face (open fraction / density), zw = the open fractions themselves.
+  beta: HEAD + `uniform sampler2D uPhi, uAU, uAV; uniform float rhoA, paddleX;     // water density = 1, air density = rhoA (= 1 / ratio)
     float rho(ivec2 c){ return mix(rhoA, 1.0, clamp(texelFetch(uPhi, c, 0).x, 0.0, 1.0)); }
-    bool solid(ivec2 c){ return texelFetch(uSolid, c, 0).x > 0.5 || float(c.x) + 0.5 < paddleX; }
+    bool pad(ivec2 c){ return float(c.x) + 0.5 < paddleX; }
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uPhi, 0);
-      if (solid(c)) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }      // obstacles take no part in the pressure solve
+      if (pad(c)) { o = vec4(0.0); return; }                       // behind the wave maker's plate
       float r = rho(c);
-      float bx = (c.x < n.x - 1 && !solid(c + ivec2(1, 0))) ? 2.0 / (r + rho(c + ivec2(1, 0))) : 0.0;
-      float by = (c.y < n.y - 1 && !solid(c + ivec2(0, 1))) ? 2.0 / (r + rho(c + ivec2(0, 1))) : 0.0;
-      o = vec4(bx, by, 0.0, 1.0);
+      float ax = (c.x < n.x - 1 && !pad(c + ivec2(1, 0))) ? texelFetch(uAU, c + ivec2(1, 0), 0).x : 0.0;
+      float ay = c.y < n.y - 1 ? texelFetch(uAV, c + ivec2(0, 1), 0).x : 0.0;
+      float bx = ax > 0.0 ? ax * 2.0 / (r + rho(c + ivec2(1, 0))) : 0.0;
+      float by = ay > 0.0 ? ay * 2.0 / (r + rho(c + ivec2(0, 1))) : 0.0;
+      o = vec4(bx, by, ax, ay);
     }`,
 
-  divMAC: HEAD + `uniform sampler2D uU, uV;
+  divMAC: HEAD + `uniform sampler2D uU, uV, uAU, uAV;     // net flow out of the open part of each face
     void main(){
-      ivec2 c = ivec2(gl_FragCoord.xy);
-      o = vec4(texelFetch(uU, c + ivec2(1, 0), 0).x - texelFetch(uU, c, 0).x
-             + texelFetch(uV, c + ivec2(0, 1), 0).x - texelFetch(uV, c, 0).x, 0.0, 0.0, 1.0);
+      ivec2 c = ivec2(gl_FragCoord.xy), r = c + ivec2(1, 0), t = c + ivec2(0, 1);
+      o = vec4(texelFetch(uAU, r, 0).x * texelFetch(uU, r, 0).x - texelFetch(uAU, c, 0).x * texelFetch(uU, c, 0).x
+             + texelFetch(uAV, t, 0).x * texelFetch(uV, t, 0).x - texelFetch(uAV, c, 0).x * texelFetch(uV, c, 0).x, 0.0, 0.0, 1.0);
     }`,
 
   // damped Jacobi on  sum_f beta_f (p_n - p) = div
@@ -325,7 +333,7 @@ const FRAG = {
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uP, 0);
       if (c.x <= 0 || c.x >= n.x) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
-      float b = texelFetch(uB, c - ivec2(1, 0), 0).x;
+      vec4 bb = texelFetch(uB, c - ivec2(1, 0), 0); float b = bb.z > 0.0 ? bb.x / bb.z : 0.0;   // 1/density on this face
       float u = texelFetch(uU, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(1, 0), 0).x);
       float w = 0.5 * (texelFetch(uPhi, c, 0).x + texelFetch(uPhi, c - ivec2(1, 0), 0).x);
       float air = 1.0 - smoothstep(0.02, 0.3, w);
@@ -336,7 +344,7 @@ const FRAG = {
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uP, 0);
       if (c.y <= 0 || c.y >= n.y) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
-      float b = texelFetch(uB, c - ivec2(0, 1), 0).y;
+      vec4 bb = texelFetch(uB, c - ivec2(0, 1), 0); float b = bb.w > 0.0 ? bb.y / bb.w : 0.0;
       float v = texelFetch(uV, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(0, 1), 0).x);
       float w = 0.5 * (texelFetch(uPhi, c, 0).x + texelFetch(uPhi, c - ivec2(0, 1), 0).x);
       float air = 1.0 - smoothstep(0.02, 0.3, w);
@@ -364,18 +372,13 @@ const FRAG = {
     }`,
 
   // Faces touching an obstacle carry the obstacle's velocity: 0, or the wave maker's for faces on/behind its plate.
-  solidFaces: HEAD + `uniform sampler2D uTex, uSolid; uniform float kind, paddleX, paddleU;
-    bool solid(ivec2 c){ ivec2 n = textureSize(uSolid, 0);
-      return c.x < 0 || c.y < 0 || c.x >= n.x || c.y >= n.y || texelFetch(uSolid, c, 0).x > 0.5; }
+  solidFaces: HEAD + `uniform sampler2D uTex, uA; uniform float kind, paddleX, paddleU;   // uA: open fraction of these faces
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy);
       float v = texelFetch(uTex, c, 0).x;
-      if (kind < 0.5) {                                   // u face between cells (x-1, y) and (x, y)
-        if (float(c.x) < paddleX + 0.5) v = paddleU;
-        else if (solid(c - ivec2(1, 0)) || solid(c)) v = 0.0;
-      } else {                                            // v face between cells (x, y-1) and (x, y)
-        if (float(c.x) + 0.5 < paddleX || solid(c - ivec2(0, 1)) || solid(c)) v = 0.0;
-      }
+      if (kind < 0.5 && float(c.x) < paddleX + 0.5) v = paddleU;          // u faces on / behind the wave maker's plate
+      else if (kind > 0.5 && float(c.x) + 0.5 < paddleX) v = 0.0;
+      else if (texelFetch(uA, c, 0).x <= 0.0) v = 0.0;                     // fully closed face
       o = vec4(v, 0.0, 0.0, 1.0);
     }`,
   // a pump / tap: inside the box the flow is driven vertically at the given speed
@@ -640,8 +643,10 @@ function buildWater(w, h) {
   WS.grid = [w, h];
   WS.U = makeDouble(w + 1, h, gl.LINEAR); WS.V = makeDouble(w, h + 1, gl.LINEAR);
   WS.phi = makeFBO(w, h, gl.LINEAR);
-  if (WS.solid) gl.deleteTexture(WS.solid.tex);
-  WS.solid = byteTex(w, h, gl.R8, gl.RED, gl.NEAREST); SOL.dirty = true;   // which simulation cells are inside obstacles
+  if (WS.aU) { gl.deleteTexture(WS.aU.tex); gl.deleteTexture(WS.aV.tex); }
+  WS.aU = byteTex(w + 1, h, gl.R8, gl.RED, gl.NEAREST, new Uint8Array((w + 1) * h).fill(255));   // open fraction of each face (cut cells)
+  WS.aV = byteTex(w, h + 1, gl.R8, gl.RED, gl.NEAREST, new Uint8Array(w * (h + 1)).fill(255));
+  SOL.dirty = true;
   WS.lv = [];
   for (;;) {
     // pressure scales with density x gravity x depth (thousands), far beyond half-float precision -> 32-bit
@@ -715,7 +720,14 @@ class Flip {
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
     // obstacles: base = solid flags without the moving wave maker; sdf = distance to the nearest obstacle (cells)
     this.base = Float32Array.from(this.s); this.obst = new Uint8Array(N); this.sdf = new Float32Array(N); this.hasObst = false;
+    // open fraction of every face (cut cells): u face (i, j) sits between cells i-1 and i, v face between j-1 and j
+    this.aU = new Float32Array(N); this.aV = new Float32Array(N);
+    for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
+      this.aU[i * fY + j] = (i >= 2 && i <= fX - 2 && j >= 1 && j <= fY - 2) ? 1 : 0;
+      this.aV[i * fY + j] = (j >= 2 && j <= fY - 2 && i >= 1 && i <= fX - 2) ? 1 : 0;
+    }
     this.paddleX = -1; this.paddleU = 0; this._padWas = false; this.jet = null;
+    this.cutCells = !!window.CUT; this.fineSDF = !!window.FINESDF;                     // particles: whole-cell solids by default (cut cells made them churn next to obstacles)
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
     this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
     this.hCount = new Int32Array(this.hx * this.hy); this.hFirst = new Int32Array(this.hx * this.hy + 1);
@@ -740,16 +752,31 @@ class Flip {
       (x, y) => water((x - 1) / this.nx, (y - 1) / this.ny) < 0 && this.free(x, y));
   }
   free(x, y) { return (!this.hasObst || this.sdfAt(x, y) > this.r) && !(this.paddleX >= 0 && x < this.paddleX + this.r); }
-  setObstacles(fn) {                               // fn(u, v) -> true where a scene / drawn obstacle is
-    const { fX, fY, nx, ny, obst, base } = this, n = fY; let any = false;
+  setObstacles() {                                 // from the shared obstacle mask: solid cells, face open fractions, distances
+    const { fX, fY, nx, ny, obst, base, aU, aV } = this, n = fY;
+    this.hasObst = !!SOL.any;
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
       const c = i * n + j, border = i === 0 || i === fX - 1 || j === 0 || j === fY - 1;
-      obst[c] = !border && fn((i - 0.5) / nx, (j - 0.5) / ny) ? 1 : 0;
-      if (obst[c]) any = true;
+      const u0 = (i - 1) / nx, v0 = (j - 1) / ny, du = 1 / nx, dv = 1 / ny;
+      const s4 = [[0.2, 0.2], [0.8, 0.2], [0.2, 0.8], [0.8, 0.8]].map(([a, b]) => maskAt(u0 + a * du, v0 + b * dv));
+      // cut cells: only cells entirely inside an obstacle are solid; otherwise any touched cell is solid (whole cells)
+      obst[c] = !border && this.hasObst && (this.cutCells ? s4.every(x => x) && maskAt(u0 + 0.5 * du, v0 + 0.5 * dv) : s4.some(x => x)) ? 1 : 0;
       base[c] = border || obst[c] ? 0 : 1;
     }
-    this.s.set(base); this._padWas = true; this.hasObst = any;
-    if (any) this.computeSDF();
+    for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
+      if (!this.hasObst) break;
+      const c = i * n + j, u0 = (i - 1) / nx, v0 = (j - 1) / ny, du = 1 / nx, dv = 1 / ny;
+      if (i >= 2 && i <= fX - 2 && j >= 1 && j <= fY - 2)
+        aU[c] = this.cutCells ? faceOpen(u0, v0, u0, v0 + dv, u0 - 0.5 * du, u0 + 0.5 * du, v0 + 0.5 * dv, v0 + 0.5 * dv) : (base[c - n] && base[c] ? 1 : 0);
+      if (j >= 2 && j <= fY - 2 && i >= 1 && i <= fX - 2)
+        aV[c] = this.cutCells ? faceOpen(u0, v0, u0 + du, v0, u0 + 0.5 * du, u0 + 0.5 * du, v0 - 0.5 * dv, v0 + 0.5 * dv) : (base[c - 1] && base[c] ? 1 : 0);
+    }
+    if (!this.hasObst) for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
+      aU[i * n + j] = (i >= 2 && i <= fX - 2 && j >= 1 && j <= fY - 2) ? 1 : 0;
+      aV[i * n + j] = (j >= 2 && j <= fY - 2 && i >= 1 && i <= fX - 2) ? 1 : 0;
+    }
+    this.s.set(base); this._padWas = true;
+    if (this.hasObst && !this.fineSDF) this.computeSDF();       // collision distances from the simulation cells
   }
   computeSDF() {                                   // two-pass chamfer distance transform, inside and outside the obstacles
     const { fX, fY, obst, N } = this, n = fY, INF = 1e6, D = Math.SQRT2;
@@ -771,7 +798,8 @@ class Flip {
     }
     for (let c = 0; c < N; c++) this.sdf[c] = obst[c] ? -(dIn[c] - 0.5) : dOut[c] - 0.5;
   }
-  sdfAt(x, y) {
+  sdfAt(x, y) {                                     // distance to the nearest obstacle, in cells (fine mask-resolution field)
+    if (SOL.sdf && this.fineSDF) return maskSDF((x - 1) / this.nx, (y - 1) / this.ny) * this.ny;
     const { fX, fY, sdf } = this, n = fY;
     const gx = Math.min(Math.max(x - 0.5, 0), fX - 1.001), gy = Math.min(Math.max(y - 0.5, 0), fY - 1.001);
     const i = Math.floor(gx), j = Math.floor(gy), tx = gx - i, ty = gy - j, c = i * n + j;
@@ -856,8 +884,8 @@ class Flip {
         for (let i = 0; i < f.length; i++) if (d[i] > 0) f[i] /= d[i];
         for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
           const c = i * n + j, solid = type[c] === F_SOLID;
-          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = i < this.paddleX + 0.5 ? this.paddleU : 0;   // walls move with the wave maker or stay put
-          if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = 0;
+          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID) || this.aU[c] === 0) this.u[c] = i < this.paddleX + 0.5 ? this.paddleU : 0;   // walls move with the wave maker or stay put
+          if (solid || (j > 0 && type[c - 1] === F_SOLID) || this.aV[c] === 0) this.v[c] = 0;
         }
       }
     }
@@ -886,7 +914,7 @@ class Flip {
     }
   }
   solve(iters, dt) {
-    const { fX, fY, u, v, s, type, dens, P } = this, n = fY, over = 1.9, rest = this.rest;
+    const { fX, fY, u, v, s, type, dens, P, aU, aV } = this, n = fY, over = 1.9, rest = this.rest;
     // Warm start: the previous pressure (mostly the weight of the water above) is applied first, so the
     // iterations only have to fix what changed. Without it, gravity (a big impulse every step) is only
     // partly cancelled and the water never quite comes to rest.
@@ -895,16 +923,18 @@ class Flip {
       const c = i * n + j;
       if (type[c] !== F_FLUID) { P[c] = 0; continue; }
       const p = P[c] * ws; P[c] = p;
-      u[c] -= s[c - n] * p; u[c + n] += s[c + n] * p; v[c] -= s[c - 1] * p; v[c + 1] += s[c + 1] * p;
+      if (s[c - n] * aU[c] > 0) u[c] -= p; if (s[c + n] * aU[c + n] > 0) u[c + n] += p;
+      if (s[c - 1] * aV[c] > 0) v[c] -= p; if (s[c + 1] * aV[c + 1] > 0) v[c + 1] += p;
     }
     for (let it = 0; it < iters; it++) for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
       const c = i * n + j; if (type[c] !== F_FLUID) continue;
       const l = c - n, r = c + n, b = c - 1, t = c + 1;
-      const sx0 = s[l], sx1 = s[r], sy0 = s[b], sy1 = s[t], sum = sx0 + sx1 + sy0 + sy1; if (sum === 0) continue;
-      let div = u[r] - u[c] + v[t] - v[c];
+      // cut cells: each face counts with its open fraction; closed faces (wall, plate) keep their own velocity
+      const sx0 = s[l] * aU[c], sx1 = s[r] * aU[r], sy0 = s[b] * aV[c], sy1 = s[t] * aV[t], sum = sx0 + sx1 + sy0 + sy1; if (sum === 0) continue;
+      let div = aU[r] * u[r] - aU[c] * u[c] + aV[t] * v[t] - aV[c] * v[c];
       if (rest > 0) { const comp = dens[c] - rest * (1 + this.band); if (comp > 0) div -= this.k * comp; }     // push apart over-packed regions
       const p = -div / sum * over;
-      u[c] -= sx0 * p; u[r] += sx1 * p; v[c] -= sy0 * p; v[t] += sy1 * p; P[c] += p;
+      if (sx0 > 0) u[c] -= p; if (sx1 > 0) u[r] += p; if (sy0 > 0) v[c] -= p; if (sy1 > 0) v[t] += p; P[c] += p;
     }
   }
   // Gravity is added to the *grid* velocity, the pressure solve then cancels what the water below holds
@@ -1059,8 +1089,8 @@ class Apic extends Flip {
         for (let i = 0; i < f.length; i++) if (d[i] > 0) f[i] /= d[i];
         for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {          // no flow through walls
           const c = i * n + j, solid = type[c] === F_SOLID;
-          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = i < this.paddleX + 0.5 ? this.paddleU : 0;
-          if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = 0;
+          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID) || this.aU[c] === 0) this.u[c] = i < this.paddleX + 0.5 ? this.paddleU : 0;
+          if (solid || (j > 0 && type[c - 1] === F_SOLID) || this.aV[c] === 0) this.v[c] = 0;
         }
       }
     }
@@ -1086,7 +1116,7 @@ class Apic extends Flip {
     }
   }
   solve(iters, dt) {
-    const { fX, fY, u, v, type, phi, dens, P, Ad, Ax, Ay, rhs, pre, res, zv, sv, As } = this, n = fY, rest = this.rest, p = this.pv_;
+    const { fX, fY, u, v, type, phi, dens, P, Ad, Ax, Ay, rhs, pre, res, zv, sv, As, aU, aV } = this, n = fY, rest = this.rest, p = this.pv_;
     // 1. assemble: sum_n coef (p_c - p_n) = -div   (air neighbours: p = 0 at the ghost-fluid distance, coef = 1/theta)
     Ad.fill(0); Ax.fill(0); Ay.fill(0); p.fill(0);
     const ws = this.lastDt > 0 ? dt / this.lastDt : 0; this.lastDt = dt;
@@ -1095,15 +1125,15 @@ class Apic extends Flip {
     for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
       const c = i * n + j;
       if (type[c] !== F_FLUID) { P[c] = 0; continue; }
-      let diag = 0;
-      for (const nb of [c - n, c + n, c - 1, c + 1]) {
-        if (type[nb] === F_SOLID) continue;
-        if (type[nb] === F_FLUID) { diag += 1; if (nb === c + n) Ax[c] = -1; else if (nb === c + 1) Ay[c] = -1; }
-        else diag += ghost(c, nb);
-      }
-      Ad[c] = diag;
-      let div = u[c + n] - u[c] + v[c + 1] - v[c];
+      let diag = 0, nb, af;                         // cut cells: every coefficient is scaled by the face's open fraction
+      nb = c - n; af = aU[c];     if (type[nb] !== F_SOLID && af > 0) diag += type[nb] === F_FLUID ? af : af * ghost(c, nb);
+      nb = c + n; af = aU[c + n]; if (type[nb] !== F_SOLID && af > 0) { if (type[nb] === F_FLUID) { diag += af; Ax[c] = -af; } else diag += af * ghost(c, nb); }
+      nb = c - 1; af = aV[c];     if (type[nb] !== F_SOLID && af > 0) diag += type[nb] === F_FLUID ? af : af * ghost(c, nb);
+      nb = c + 1; af = aV[c + 1]; if (type[nb] !== F_SOLID && af > 0) { if (type[nb] === F_FLUID) { diag += af; Ay[c] = -af; } else diag += af * ghost(c, nb); }
+      let div = aU[c + n] * u[c + n] - aU[c] * u[c] + aV[c + 1] * v[c + 1] - aV[c] * v[c];
       const comp = dens[c] - rest; if (comp > 0) div -= this.k * comp;           // gentle push-apart of over-packed particles
+      if (diag === 0) { diag = 1; div = 0; }        // a sealed pocket
+      Ad[c] = diag;
       rhs[c] = -div; bmax = Math.max(bmax, Math.abs(div));
       p[c] = P[c] * ws;                                                          // warm start from last step's pressure
     }
@@ -1150,10 +1180,10 @@ class Apic extends Flip {
       const c = i * n + j; if (type[c] !== F_FLUID) continue;
       P[c] = p[c];
       const R = c + n, L = c - n, T = c + 1, D = c - 1;
-      if (type[R] === F_FLUID) u[R] -= p[R] - p[c]; else if (type[R] === F_AIR) u[R] -= ghost(c, R) * (0 - p[c]);
-      if (type[L] === F_AIR) u[c] -= ghost(c, L) * (p[c] - 0);
-      if (type[T] === F_FLUID) v[T] -= p[T] - p[c]; else if (type[T] === F_AIR) v[T] -= ghost(c, T) * (0 - p[c]);
-      if (type[D] === F_AIR) v[c] -= ghost(c, D) * (p[c] - 0);
+      if (aU[R] > 0) { if (type[R] === F_FLUID) u[R] -= p[R] - p[c]; else if (type[R] === F_AIR) u[R] -= ghost(c, R) * (0 - p[c]); }
+      if (aU[c] > 0 && type[L] === F_AIR) u[c] -= ghost(c, L) * (p[c] - 0);
+      if (aV[T] > 0) { if (type[T] === F_FLUID) v[T] -= p[T] - p[c]; else if (type[T] === F_AIR) v[T] -= ghost(c, T) * (0 - p[c]); }
+      if (aV[c] > 0 && type[D] === F_AIR) v[c] -= ghost(c, D) * (p[c] - 0);
     }
   }
   substep(dt, gx, gy) {
@@ -1247,7 +1277,7 @@ function stepFlip(dt) {
 function gridSolidFaces() {
   const H = WS.grid[1], pd = paddleNow();
   for (const [kind, T] of [[0, WS.U], [1, WS.V]]) {
-    texUnit = 0; const u = use(P.solidFaces); bindTex(u.uTex, T.read); bindTex(u.uSolid, WS.solid);
+    texUnit = 0; const u = use(P.solidFaces); bindTex(u.uTex, T.read); bindTex(u.uA, kind ? WS.aV : WS.aU);
     gl.uniform1f(u.kind, kind); gl.uniform1f(u.paddleX, pd ? pd.x * H : -1); gl.uniform1f(u.paddleU, pd ? pd.v * H : 0);
     blit(T.write); T.swap();
   }
@@ -1293,10 +1323,10 @@ function stepWater(dt) {
 
   // pressure projection with density-dependent coefficients
   const pdb = paddleNow();
-  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); bindTex(u.uSolid, WS.solid);
+  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); bindTex(u.uAU, WS.aU); bindTex(u.uAV, WS.aV);
   gl.uniform1f(u.rhoA, 1 / Math.min(cfg.density, CAN_F32 ? 2000 : 30)); gl.uniform1f(u.paddleX, pdb ? pdb.x * H : -1); blit(L0.b);
   for (let l = 0; l + 1 < WS.lv.length; l++) { texUnit = 0; u = use(P.restrictBetaW); bindTex(u.uB, WS.lv[l].b); blit(WS.lv[l + 1].b); }
-  texUnit = 0; u = use(P.divMAC); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); blit(L0.d);
+  texUnit = 0; u = use(P.divMAC); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); bindTex(u.uAU, WS.aU); bindTex(u.uAV, WS.aV); blit(L0.d);
   // warm start from last step's pressure, rescaled for the time step (hydrostatic pressure here is proportional to dt;
   // without the rescale a frame-time hiccup hands the solver a wrong guess and the surface gets a kick)
   const wsc = WS.lastDt ? dt / WS.lastDt : 1; WS.lastDt = dt;
@@ -1413,16 +1443,58 @@ function updateSolids(force = false) {
   for (let k = 0; k < w * h; k++) { data[2 * k] = mat[k] ? 255 : 0; data[2 * k + 1] = g[k] * 40; }
   gl.bindTexture(gl.TEXTURE_2D, SOL.tex.tex); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
   gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RG, gl.UNSIGNED_BYTE, data);
-  // a cell counts as solid if any of four sample points inside it is solid (keeps thin walls watertight)
-  const solidCell = (u0, v0, du, dv) => maskAt(u0 + 0.25 * du, v0 + 0.25 * dv) || maskAt(u0 + 0.75 * du, v0 + 0.25 * dv)
-                                    || maskAt(u0 + 0.25 * du, v0 + 0.75 * dv) || maskAt(u0 + 0.75 * du, v0 + 0.75 * dv);
-  if (WS.solid) {
-    const [W, H] = WS.grid, cells = new Uint8Array(W * H);
-    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) cells[j * W + i] = solidCell(i / W, j / H, 1 / W, 1 / H) ? 255 : 0;
-    gl.bindTexture(gl.TEXTURE_2D, WS.solid.tex);
-    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RED, gl.UNSIGNED_BYTE, cells);
+  SOL.any = mat.some(m => m);
+  SOL.sdf = SOL.any ? maskDistance() : null;
+  if (WS.aU) {
+    const [W, H] = WS.grid, au = new Uint8Array((W + 1) * H), av = new Uint8Array(W * (H + 1));
+    for (let j = 0; j < H; j++) for (let i = 0; i <= W; i++)
+      au[j * (W + 1) + i] = (i === 0 || i === W) ? 0 : Math.round(255 * faceOpen(i / W, j / H, i / W, (j + 1) / H, (i - 0.5) / W, (i + 0.5) / W, (j + 0.5) / H, (j + 0.5) / H));
+    for (let j = 0; j <= H; j++) for (let i = 0; i < W; i++)
+      av[j * W + i] = (j === 0 || j === H) ? 0 : Math.round(255 * faceOpen(i / W, j / H, (i + 1) / W, j / H, (i + 0.5) / W, (i + 0.5) / W, (j - 0.5) / H, (j + 0.5) / H));
+    gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+    gl.bindTexture(gl.TEXTURE_2D, WS.aU.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W + 1, H, gl.RED, gl.UNSIGNED_BYTE, au);
+    gl.bindTexture(gl.TEXTURE_2D, WS.aV.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H + 1, gl.RED, gl.UNSIGNED_BYTE, av);
   }
-  if (FL.sim) { const f = FL.sim; f.setObstacles((u, v) => solidCell(u - 0.5 / f.nx, v - 0.5 / f.ny, 1 / f.nx, 1 / f.ny)); }
+  if (FL.sim) FL.sim.setObstacles();
+}
+// Open fraction of a face (segment a->b, in uv): the share of it that is not inside an obstacle. A face is also
+// closed when a wall thinner than a cell runs between the two cell centres it connects (c0 -> c1), so thin walls
+// such as a glass stay watertight. Faces where one centre is inside the solid keep their fraction (slopes).
+function faceOpen(ax, ay, bx, by, c0x, c1x, c0y, c1y) {
+  let open = 0;
+  for (let k = 0; k < 6; k++) { const t = (k + 0.5) / 6; if (!maskAt(ax + (bx - ax) * t, ay + (by - ay) * t)) open++; }
+  if (open && !maskAt(c0x, c0y) && !maskAt(c1x, c1y))
+    for (let k = 1; k < 8; k++) { const t = k / 8; if (maskAt(c0x + (c1x - c0x) * t, c0y + (c1y - c0y) * t)) return 0; }
+  return open / 6;
+}
+// Signed distance to the obstacles at full mask resolution (texels; < 0 inside), for particle collisions.
+function maskDistance() {
+  const { w, h, mat } = SOL, N = w * h, INF = 1e6, D = Math.SQRT2;
+  const dOut = new Float32Array(N), dIn = new Float32Array(N);
+  for (let k = 0; k < N; k++) { dOut[k] = mat[k] ? 0 : INF; dIn[k] = mat[k] ? INF : 0; }
+  for (const d of [dOut, dIn]) {
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      const k = j * w + i; let v = d[k];
+      if (j > 0) { v = Math.min(v, d[k - w] + 1); if (i > 0) v = Math.min(v, d[k - w - 1] + D); if (i < w - 1) v = Math.min(v, d[k - w + 1] + D); }
+      if (i > 0) v = Math.min(v, d[k - 1] + 1);
+      d[k] = v;
+    }
+    for (let j = h - 1; j >= 0; j--) for (let i = w - 1; i >= 0; i--) {
+      const k = j * w + i; let v = d[k];
+      if (j < h - 1) { v = Math.min(v, d[k + w] + 1); if (i < w - 1) v = Math.min(v, d[k + w + 1] + D); if (i > 0) v = Math.min(v, d[k + w - 1] + D); }
+      if (i < w - 1) v = Math.min(v, d[k + 1] + 1);
+      d[k] = v;
+    }
+  }
+  const out = new Float32Array(N);
+  for (let k = 0; k < N; k++) out[k] = mat[k] ? -(dIn[k] - 0.5) : dOut[k] - 0.5;
+  return out;
+}
+function maskSDF(u, v) {                           // bilinear, in screen heights
+  const { w, h, sdf } = SOL;
+  const x = Math.min(Math.max(u * w - 0.5, 0), w - 1.001), y = Math.min(Math.max(v * h - 0.5, 0), h - 1.001);
+  const i = Math.floor(x), j = Math.floor(y), tx = x - i, ty = y - j, k = j * w + i;
+  return ((sdf[k] * (1 - tx) + sdf[k + 1] * tx) * (1 - ty) + (sdf[k + w] * (1 - tx) + sdf[k + w + 1] * tx) * ty) / h;
 }
 function paddleNow() {                             // wave maker plate: position (screen heights from the left wall) and speed
   if (!PADDLE.on) return null;

@@ -1,0 +1,572 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
+<meta name="theme-color" content="#000000">
+<title>Fluid Simulation 3D</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; overscroll-behavior: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none; -webkit-tap-highlight-color: transparent; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; }
+  #hud { position: fixed; left: 0; right: 0; bottom: 0; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; z-index: 2;
+    padding: 10px calc(12px + env(safe-area-inset-right)) calc(10px + env(safe-area-inset-bottom)) calc(12px + env(safe-area-inset-left));
+    font: 12px/1 system-ui, sans-serif; color: #fff9; pointer-events: none; }
+  #hud button, #hud a { pointer-events: auto; font: inherit; color: #fffc; background: #ffffff1f; border: 1px solid #ffffff2e; text-decoration: none;
+    border-radius: 999px; padding: 9px 14px; white-space: nowrap; backdrop-filter: blur(6px); -webkit-backdrop-filter: blur(6px); }
+  #hud button:active { background: #ffffff40; }
+  #stats { margin-left: auto; white-space: nowrap; font-size: 11px; font-variant-numeric: tabular-nums; }
+  #msg { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
+    color: #fff; font: 16px/1.4 system-ui, sans-serif; text-align: center; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+<div id="hud">
+  <button id="reset">Reset</button>
+  <button id="scene">Scene: Tank</button>
+  <button id="tool">Drag: Orbit</button>
+  <button id="quality">Quality: Medium</button>
+  <button id="motion" hidden>Tilt: off</button>
+  <a href="index.html">2D</a>
+  <div id="stats"></div>
+</div>
+<div id="msg"></div>
+<script>
+'use strict';
+// =====================================================================================================
+// 3D water: GPU FLIP (particles + staggered grid) in WebGL2, drawn with screen-space fluid rendering.
+//  * Particles live in float textures (position, velocity). The 3D grid is stored as z-slices tiled in a 2D
+//    texture ("atlas"), so every grid step is one full-screen pass.
+//  * Particle -> grid: each particle is drawn as a 1-pixel point into the atlas once per corner of its cell
+//    (8 corners x 3 velocity components), with additive blending: sum(w * v) and sum(w).
+//  * Gravity is added on the grid; the pressure solve (Jacobi, warm-started) makes it divergence-free; particles
+//    take the change back (FLIP) blended with the new grid velocity (PIC) and move with it (RK2).
+//  * Rendering: particles -> sphere depth buffer -> bilateral smoothing -> normals -> Fresnel reflection,
+//    refraction of the tank floor, and Beer-Lambert absorption by thickness.
+// =====================================================================================================
+const canvas = document.getElementById('c'), $ = id => document.getElementById(id);
+function fail(t) { const m = $('msg'); m.textContent = t; m.style.display = 'flex'; throw new Error(t); }
+const gl = canvas.getContext('webgl2', { antialias: false, alpha: false, depth: false, powerPreference: 'high-performance' });
+if (!gl) fail('This needs WebGL2.');
+if (!gl.getExtension('EXT_color_buffer_float')) fail('This needs float render targets (EXT_color_buffer_float).');
+gl.getExtension('OES_texture_float_linear');
+
+const QUALITY = [{ name: 'Low', g: 16 }, { name: 'Medium', g: 24 }, { name: 'High', g: 32 }];
+const cfg = { quality: 1, gravity: 30, flip: 0.95, iters: 50, substeps: 2, maxDpr: 1.5 };
+
+// ----- GLSL ----------------------------------------------------------------------------------------
+const QUAD_VS = `#version 300 es
+in vec2 aPos; out vec2 vUv;
+void main(){ vUv = aPos * 0.5 + 0.5; gl_Position = vec4(aPos, 0.0, 1.0); }`;
+const HEAD = `#version 300 es
+precision highp float; precision highp int; precision highp sampler2D;
+`;
+// atlas addressing: N = grid nodes per axis (cells + 1), TX = slices per atlas row
+const ATLAS = `
+uniform ivec3 N; uniform int TX;
+ivec2 atl(ivec3 p){ return ivec2((p.z % TX) * N.x + p.x, (p.z / TX) * N.y + p.y); }
+ivec3 cellOf(ivec2 a){ int tx = a.x / N.x, ty = a.y / N.y; return ivec3(a.x - tx * N.x, a.y - ty * N.y, ty * TX + tx); }
+bool inGrid(ivec3 p){ return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, N)); }
+vec4 at(sampler2D t, ivec3 p){ return inGrid(p) ? texelFetch(t, atl(p), 0) : vec4(0.0); }
+bool isCell(ivec3 p){ return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, N - 1)); }
+`;
+const SAMPLE = `
+// trilinear sample of one staggered velocity component (0 = u on x-faces, 1 = v, 2 = w) at x (grid units)
+float comp3(sampler2D t, vec3 x, int c){
+  vec3 off = c == 0 ? vec3(0.0, 0.5, 0.5) : c == 1 ? vec3(0.5, 0.0, 0.5) : vec3(0.5, 0.5, 0.0);
+  vec3 g = clamp(x - off, vec3(0.0), vec3(N - 1) - 0.001); ivec3 b = ivec3(floor(g)); vec3 f = g - vec3(b);
+  float s = 0.0;
+  for (int k = 0; k < 8; k++) {
+    ivec3 o = ivec3(k & 1, (k >> 1) & 1, (k >> 2) & 1); vec3 w = mix(1.0 - f, f, vec3(o));
+    s += w.x * w.y * w.z * at(t, b + o)[c];
+  }
+  return s;
+}
+vec3 velAt(sampler2D t, vec3 x){ return vec3(comp3(t, x, 0), comp3(t, x, 1), comp3(t, x, 2)); }
+`;
+// particle -> grid splat (one corner, one component per draw)
+const P2G_VS = HEAD + ATLAS + `
+uniform sampler2D uPos, uVel; uniform int PW, comp; uniform ivec3 corner; uniform vec2 atlasSize;
+out vec2 vVal;
+void main(){
+  ivec2 pi = ivec2(gl_VertexID % PW, gl_VertexID / PW);
+  vec3 x = texelFetch(uPos, pi, 0).xyz, v = texelFetch(uVel, pi, 0).xyz;
+  vec3 off = comp == 0 ? vec3(0.0, 0.5, 0.5) : comp == 1 ? vec3(0.5, 0.0, 0.5) : vec3(0.5, 0.5, 0.0);
+  vec3 g = x - off; ivec3 b = ivec3(floor(g)); vec3 f = g - vec3(b);
+  ivec3 node = b + corner; vec3 wv = mix(1.0 - f, f, vec3(corner)); float w = wv.x * wv.y * wv.z;
+  vVal = vec2(v[comp] * w, w);
+  gl_PointSize = 1.0;
+  if (!inGrid(node) || w <= 0.0) { gl_Position = vec4(2.0, 2.0, 0.0, 1.0); return; }
+  gl_Position = vec4((vec2(atl(node)) + 0.5) / atlasSize * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const P2G_FS = HEAD + `in vec2 vVal; out vec4 o; void main(){ o = vec4(vVal, 0.0, 0.0); }`;
+// which cells hold water
+const MARK_VS = HEAD + ATLAS + `
+uniform sampler2D uPos; uniform int PW; uniform vec2 atlasSize;
+void main(){
+  ivec2 pi = ivec2(gl_VertexID % PW, gl_VertexID / PW);
+  ivec3 c = ivec3(floor(texelFetch(uPos, pi, 0).xyz));
+  gl_PointSize = 1.0;
+  gl_Position = isCell(c) ? vec4((vec2(atl(c)) + 0.5) / atlasSize * 2.0 - 1.0, 0.0, 1.0) : vec4(2.0, 2.0, 0.0, 1.0);
+}`;
+const MARK_FS = HEAD + `out vec4 o; void main(){ o = vec4(1.0, 0.0, 0.0, 0.0); }`;
+const GRID = {
+  // sums -> velocities, walls closed
+  normalize: HEAD + ATLAS + `uniform sampler2D uA0, uA1, uA2; in vec2 vUv; out vec4 o;
+    void main(){
+      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a); int G = N.x - 1;
+      if (!inGrid(p)) { o = vec4(0.0); return; }
+      vec2 s0 = texelFetch(uA0, a, 0).xy, s1 = texelFetch(uA1, a, 0).xy, s2 = texelFetch(uA2, a, 0).xy;
+      vec3 v = vec3(s0.y > 0.0 ? s0.x / s0.y : 0.0, s1.y > 0.0 ? s1.x / s1.y : 0.0, s2.y > 0.0 ? s2.x / s2.y : 0.0);
+      if (p.x == 0 || p.x == G) v.x = 0.0; if (p.y == 0 || p.y == G) v.y = 0.0; if (p.z == 0 || p.z == G) v.z = 0.0;
+      o = vec4(v, 0.0);
+    }`,
+  // gravity on faces next to water, the stirring finger, walls
+  forces: HEAD + ATLAS + `uniform sampler2D uVel, uMark; uniform vec3 g, stirPos, stirVel; uniform float dt, stirR; in vec2 vUv; out vec4 o;
+    bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5; }
+    void main(){
+      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a); int G = N.x - 1;
+      if (!inGrid(p)) { o = vec4(0.0); return; }
+      vec3 v = texelFetch(uVel, a, 0).xyz;
+      if (fluid(p - ivec3(1, 0, 0)) || fluid(p)) v.x += g.x * dt;
+      if (fluid(p - ivec3(0, 1, 0)) || fluid(p)) v.y += g.y * dt;
+      if (fluid(p - ivec3(0, 0, 1)) || fluid(p)) v.z += g.z * dt;
+      if (stirR > 0.0) {
+        vec3 fp = vec3(p);
+        v.x += stirVel.x * exp(-dot(fp + vec3(0.0, 0.5, 0.5) - stirPos, fp + vec3(0.0, 0.5, 0.5) - stirPos) / (stirR * stirR));
+        v.y += stirVel.y * exp(-dot(fp + vec3(0.5, 0.0, 0.5) - stirPos, fp + vec3(0.5, 0.0, 0.5) - stirPos) / (stirR * stirR));
+        v.z += stirVel.z * exp(-dot(fp + vec3(0.5, 0.5, 0.0) - stirPos, fp + vec3(0.5, 0.5, 0.0) - stirPos) / (stirR * stirR));
+      }
+      if (p.x == 0 || p.x == G) v.x = 0.0; if (p.y == 0 || p.y == G) v.y = 0.0; if (p.z == 0 || p.z == G) v.z = 0.0;
+      o = vec4(v, 0.0);
+    }`,
+  divergence: HEAD + ATLAS + `uniform sampler2D uVel, uMark; in vec2 vUv; out vec4 o;
+    void main(){
+      ivec3 p = cellOf(ivec2(gl_FragCoord.xy));
+      if (!isCell(p) || at(uMark, p).x < 0.5) { o = vec4(0.0); return; }
+      vec3 c = at(uVel, p).xyz;
+      o = vec4(at(uVel, p + ivec3(1, 0, 0)).x - c.x + at(uVel, p + ivec3(0, 1, 0)).y - c.y + at(uVel, p + ivec3(0, 0, 1)).z - c.z, 0.0, 0.0, 0.0);
+    }`,
+  // Jacobi: water cells; air neighbours p = 0 (free surface); walls contribute nothing (no flow through them)
+  jacobi: HEAD + ATLAS + `uniform sampler2D uP, uDiv, uMark; in vec2 vUv; out vec4 o;
+    bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5; }
+    void main(){
+      ivec3 p = cellOf(ivec2(gl_FragCoord.xy));
+      if (!fluid(p)) { o = vec4(0.0); return; }
+      float s = 0.0, n = 0.0;
+      ivec3 d[6] = ivec3[6](ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0), ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1));
+      for (int k = 0; k < 6; k++) {
+        ivec3 q = p + d[k];
+        if (!isCell(q)) continue;
+        n += 1.0;
+        if (fluid(q)) s += at(uP, q).x;
+      }
+      o = vec4((s - at(uDiv, p).x) / max(n, 1.0), 0.0, 0.0, 0.0);
+    }`,
+  scale: HEAD + `uniform sampler2D uTex; uniform float k; in vec2 vUv; out vec4 o; void main(){ o = texelFetch(uTex, ivec2(gl_FragCoord.xy), 0) * k; }`,
+  gradient: HEAD + ATLAS + `uniform sampler2D uVel, uP, uMark; in vec2 vUv; out vec4 o;
+    bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5; }
+    void main(){
+      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a); int G = N.x - 1;
+      if (!inGrid(p)) { o = vec4(0.0); return; }
+      vec3 v = texelFetch(uVel, a, 0).xyz; float pc = at(uP, p).x;
+      ivec3 ex = p - ivec3(1, 0, 0), ey = p - ivec3(0, 1, 0), ez = p - ivec3(0, 0, 1);
+      if (p.x > 0 && p.x < G && (fluid(ex) || fluid(p))) v.x -= pc - at(uP, ex).x;
+      if (p.y > 0 && p.y < G && (fluid(ey) || fluid(p))) v.y -= pc - at(uP, ey).x;
+      if (p.z > 0 && p.z < G && (fluid(ez) || fluid(p))) v.z -= pc - at(uP, ez).x;
+      if (p.x == 0 || p.x == G) v.x = 0.0; if (p.y == 0 || p.y == G) v.y = 0.0; if (p.z == 0 || p.z == G) v.z = 0.0;
+      o = vec4(v, 0.0);
+    }`,
+  // grid -> particles (FLIP/PIC blend) and move them (RK2 through the new grid velocity)
+  g2p: HEAD + ATLAS + SAMPLE + `uniform sampler2D uPos, uVel, uGrid, uGridOld; uniform float dt, flip, np; uniform int PW;
+    in vec2 vUv; layout(location = 0) out vec4 oPos; layout(location = 1) out vec4 oVel;
+    void main(){
+      ivec2 pi = ivec2(gl_FragCoord.xy);
+      vec4 P = texelFetch(uPos, pi, 0), V = texelFetch(uVel, pi, 0);
+      if (float(pi.y * PW + pi.x) >= np) { oPos = P; oVel = V; return; }
+      vec3 x = P.xyz, pic = velAt(uGrid, x), flipV = V.xyz + pic - velAt(uGridOld, x);
+      vec3 v = mix(pic, flipV, flip);
+      vec3 mid = x + 0.5 * dt * pic;
+      vec3 nx = x + dt * velAt(uGrid, mid);
+      float G = float(N.x - 1), r = 0.3;
+      vec3 lo = vec3(r), hi = vec3(G - r);
+      if (nx.x < lo.x || nx.x > hi.x) v.x = 0.0; if (nx.y < lo.y || nx.y > hi.y) v.y = 0.0; if (nx.z < lo.z || nx.z > hi.z) v.z = 0.0;
+      oPos = vec4(clamp(nx, lo, hi), 1.0); oVel = vec4(v, 0.0);
+    }`,
+};
+// ----- rendering ---------------------------------------------------------------------------------
+const SPRITE_VS = HEAD + `
+uniform sampler2D uPos; uniform int PW, G; uniform mat4 uView, uProj; uniform float radius, pxScale;
+out vec3 vEye; out float vR;
+void main(){
+  ivec2 pi = ivec2(gl_VertexID % PW, gl_VertexID / PW);
+  vec3 x = texelFetch(uPos, pi, 0).xyz / float(G) - vec3(0.5, 0.0, 0.5);
+  vec4 e = uView * vec4(x, 1.0); vEye = e.xyz; vR = radius;
+  gl_Position = uProj * e;
+  gl_PointSize = clamp(radius * pxScale / -e.z, 1.0, 64.0);
+}`;
+const DEPTH_FS = HEAD + `uniform mat4 uProj; in vec3 vEye; in float vR; out vec4 o;
+void main(){
+  vec2 d = gl_PointCoord * 2.0 - 1.0; d.y = -d.y; float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  vec3 pe = vEye + vec3(d, sqrt(1.0 - r2)) * vR;              // front of the sphere, eye space
+  vec4 c = uProj * vec4(pe, 1.0);
+  gl_FragDepth = c.z / c.w * 0.5 + 0.5;
+  o = vec4(-pe.z, 0.0, 0.0, 0.0);                             // distance in front of the camera
+}`;
+const THICK_FS = HEAD + `in vec3 vEye; in float vR; out vec4 o;
+void main(){
+  vec2 d = gl_PointCoord * 2.0 - 1.0; float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  o = vec4(2.0 * vR * sqrt(1.0 - r2) * 0.55, 0.0, 0.0, 0.0);
+}`;
+// narrow-range bilateral filter: smooths the bumps between spheres, keeps real edges
+const BLUR_FS = HEAD + `uniform sampler2D uTex; uniform vec2 dir; uniform float range; in vec2 vUv; out vec4 o;
+void main(){
+  float c = texture(uTex, vUv).x;
+  if (c > 1e4) { o = vec4(c); return; }
+  float s = 0.0, w = 0.0;
+  for (int i = -7; i <= 7; i++) {
+    float d = texture(uTex, vUv + dir * float(i)).x;
+    if (d > 1e4) continue;
+    float k = exp(-float(i * i) / 18.0) * exp(-(d - c) * (d - c) / (range * range));
+    s += d * k; w += k;
+  }
+  o = vec4(s / w);
+}`;
+const COMPOSITE_FS = HEAD + `
+uniform sampler2D uDepth, uThick; uniform vec3 camPos, camF, camR, camU, sunDir; uniform vec2 tanHalf, texel; in vec2 vUv; out vec4 o;
+vec3 sky(vec3 d){
+  vec3 c = mix(vec3(0.75, 0.82, 0.9), vec3(0.25, 0.45, 0.75), clamp(d.y * 1.4, 0.0, 1.0));
+  return c + vec3(1.0, 0.92, 0.8) * pow(max(dot(d, sunDir), 0.0), 600.0) * 4.0;
+}
+float tiles(vec2 p, float n){ vec2 g = abs(fract(p * n) - 0.5); return smoothstep(0.46, 0.5, max(g.x, g.y)); }
+bool boxHit(vec3 ro, vec3 rd, out float t0, out float t1){
+  vec3 lo = vec3(-0.5, 0.0, -0.5), hi = vec3(0.5, 1.0, 0.5), inv = 1.0 / rd;
+  vec3 a = (lo - ro) * inv, b = (hi - ro) * inv, mn = min(a, b), mx = max(a, b);
+  t0 = max(max(mn.x, mn.y), mn.z); t1 = min(min(mx.x, mx.y), mx.z); return t1 > max(t0, 0.0);
+}
+// everything except the water: tiled tank floor, floor around it, sky
+vec3 scene(vec3 ro, vec3 rd){
+  if (rd.y < -1e-4) {
+    float t = -ro.y / rd.y; vec3 p = ro + rd * t;
+    float sun = max(sunDir.y, 0.0) * 0.8 + 0.25;
+    vec3 c;
+    if (abs(p.x) < 0.5 && abs(p.z) < 0.5) c = mix(vec3(0.82, 0.9, 0.95), vec3(0.35, 0.55, 0.65), tiles(p.xz, 8.0));
+    else c = mix(vec3(0.42, 0.40, 0.38), vec3(0.32, 0.30, 0.29), step(0.5, fract((floor(p.x * 2.0) + floor(p.z * 2.0)) * 0.5)));
+    c *= sun;
+    return mix(c, sky(rd), clamp(t * 0.06, 0.0, 0.7));
+  }
+  return sky(rd);
+}
+vec3 glass(vec3 ro, vec3 rd, vec3 c){                         // faint reflections and bright edges of the glass tank
+  float t0, t1;
+  if (!boxHit(ro, rd, t0, t1)) return c;
+  vec3 p = ro + rd * max(t0, 0.0), q = abs(p - vec3(0.0, 0.5, 0.0)) - vec3(0.5, 0.5, 0.5);
+  float e1 = min(min(abs(q.x - q.y) + abs(q.x) + abs(q.y), abs(q.y - q.z) + abs(q.y) + abs(q.z)), abs(q.x - q.z) + abs(q.x) + abs(q.z));
+  return c * 0.96 + sky(reflect(rd, normalize(sign(q) * step(vec3(-0.002), q)))) * 0.04 + vec3(0.9) * smoothstep(0.012, 0.0, e1) * 0.35;
+}
+vec3 rayDir(vec2 uv){ vec2 s = uv * 2.0 - 1.0; return normalize(camF + s.x * tanHalf.x * camR + s.y * tanHalf.y * camU); }
+vec3 posAt(vec2 uv){ vec3 rd = rayDir(uv); return camPos + rd * (texture(uDepth, uv).x / dot(rd, camF)); }
+void main(){
+  vec3 rd = rayDir(vUv);
+  vec3 col = scene(camPos, rd);
+  float d = texture(uDepth, vUv).x;
+  if (d < 1e4) {
+    vec3 P = posAt(vUv);
+    vec3 dx1 = posAt(vUv + vec2(texel.x, 0.0)) - P, dx2 = P - posAt(vUv - vec2(texel.x, 0.0));
+    vec3 dy1 = posAt(vUv + vec2(0.0, texel.y)) - P, dy2 = P - posAt(vUv - vec2(0.0, texel.y));
+    vec3 ddx = length(dx1) < length(dx2) ? dx1 : dx2, ddy = length(dy1) < length(dy2) ? dy1 : dy2;
+    vec3 n = normalize(cross(ddx, ddy)); if (dot(n, rd) > 0.0) n = -n;
+    float T = texture(uThick, vUv).x;
+    vec3 rr = refract(rd, n, 1.0 / 1.33);
+    vec3 behind = scene(P, rr);                                  // the floor seen through the water, bent by refraction
+    vec3 A = exp(-vec3(2.4, 0.75, 0.32) * T * 2.2);              // red is absorbed first
+    vec3 water = behind * A + vec3(0.02, 0.18, 0.28) * (1.0 - A);
+    float F = 0.02 + 0.98 * pow(1.0 - max(dot(-rd, n), 0.0), 5.0);
+    vec3 rf = reflect(rd, n);
+    col = mix(water, sky(rf), F) + vec3(1.0, 0.95, 0.85) * pow(max(dot(rf, sunDir), 0.0), 300.0) * 2.0;
+  }
+  col = glass(camPos, rd, col);
+  o = vec4(pow(col, vec3(1.0 / 1.1)), 1.0);
+}`;
+
+// ----- GL plumbing ---------------------------------------------------------------------------------
+function compile(type, src) {
+  const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
+  if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fail('Shader error:\n' + gl.getShaderInfoLog(s));
+  return s;
+}
+function program(vs, fs) {
+  const p = gl.createProgram();
+  gl.attachShader(p, compile(gl.VERTEX_SHADER, vs)); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, fs));
+  gl.bindAttribLocation(p, 0, 'aPos'); gl.linkProgram(p);
+  if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail('Link error:\n' + gl.getProgramInfoLog(p));
+  const u = {}, n = gl.getProgramParameter(p, gl.ACTIVE_UNIFORMS);
+  for (let i = 0; i < n; i++) { const nm = gl.getActiveUniform(p, i).name.replace(/\[0\]$/, ''); u[nm] = gl.getUniformLocation(p, nm); }
+  return { p, u };
+}
+const PR = {};
+for (const k in GRID) PR[k] = program(QUAD_VS, GRID[k]);
+PR.p2g = program(P2G_VS, P2G_FS); PR.mark = program(MARK_VS, MARK_FS);
+PR.depth = program(SPRITE_VS, DEPTH_FS); PR.thick = program(SPRITE_VS, THICK_FS);
+PR.blur = program(QUAD_VS, BLUR_FS); PR.composite = program(QUAD_VS, COMPOSITE_FS);
+
+const quadVAO = gl.createVertexArray(); gl.bindVertexArray(quadVAO);
+gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
+gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1, -1, 1, -1, -1, 1, 1, 1]), gl.STATIC_DRAW);
+gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+const emptyVAO = gl.createVertexArray();
+
+function tex(w, h, ifmt, fmt, type, filter, data = null) {
+  const t = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, t);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, ifmt, w, h, 0, fmt, type, data);
+  return t;
+}
+function target(w, h, ifmt = gl.RGBA16F, filter = gl.NEAREST, depth = false) {
+  const t = tex(w, h, ifmt, ifmt === gl.R32F || ifmt === gl.R16F ? gl.RED : gl.RGBA, ifmt === gl.RGBA32F || ifmt === gl.R32F ? gl.FLOAT : gl.HALF_FLOAT, filter);
+  const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+  gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, t, 0);
+  let rb = null;
+  if (depth) { rb = gl.createRenderbuffer(); gl.bindRenderbuffer(gl.RENDERBUFFER, rb); gl.renderbufferStorage(gl.RENDERBUFFER, gl.DEPTH_COMPONENT24, w, h);
+    gl.framebufferRenderbuffer(gl.FRAMEBUFFER, gl.DEPTH_ATTACHMENT, gl.RENDERBUFFER, rb); }
+  if (gl.checkFramebufferStatus(gl.FRAMEBUFFER) !== gl.FRAMEBUFFER_COMPLETE) fail('Render target unsupported.');
+  return { tex: t, fb, w, h, rb, free() { gl.deleteTexture(t); gl.deleteFramebuffer(fb); if (rb) gl.deleteRenderbuffer(rb); } };
+}
+let unit = 0;
+function bind(loc, t) { gl.activeTexture(gl.TEXTURE0 + unit); gl.bindTexture(gl.TEXTURE_2D, t.tex || t); gl.uniform1i(loc, unit++); }
+function draw(prog, tgt, setup) {
+  gl.useProgram(prog.p); unit = 0;
+  if (tgt) { gl.bindFramebuffer(gl.FRAMEBUFFER, tgt.fb); gl.viewport(0, 0, tgt.w, tgt.h); }
+  else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.viewport(0, 0, canvas.width, canvas.height); }
+  setup(prog.u);
+  gl.bindVertexArray(quadVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+}
+function clear(tgt, r = 0) { gl.bindFramebuffer(gl.FRAMEBUFFER, tgt.fb); gl.viewport(0, 0, tgt.w, tgt.h); gl.clearColor(r, r, r, r); gl.clear(gl.COLOR_BUFFER_BIT); }
+
+// ----- simulation state ----------------------------------------------------------------------------
+const SIM = {};
+function buildSim() {
+  for (const k of ['acc0', 'acc1', 'acc2', 'mark', 'vel', 'velOld', 'velTmp', 'div', 'p0', 'p1', 'pos0', 'pos1', 'vel0', 'vel1']) if (SIM[k]) SIM[k].free();
+  if (SIM.mrt) SIM.mrt.forEach(f => gl.deleteFramebuffer(f));
+  const G = QUALITY[cfg.quality].g, N = G + 1, TX = Math.ceil(Math.sqrt(N)), TY = Math.ceil(N / TX);
+  Object.assign(SIM, { G, N, TX, AW: TX * N, AH: TY * N });
+  const A = (f = gl.RGBA16F) => target(SIM.AW, SIM.AH, f);
+  SIM.acc0 = A(); SIM.acc1 = A(); SIM.acc2 = A(); SIM.mark = A(gl.R16F);
+  SIM.vel = A(); SIM.velOld = A(); SIM.velTmp = A(); SIM.div = A(gl.R32F); SIM.p0 = A(gl.R32F); SIM.p1 = A(gl.R32F);
+  // particles: 8 per cell in the water; texture big enough for a full tank
+  SIM.PW = Math.ceil(Math.sqrt(G * G * G * 8 * 0.75));
+  const P = () => target(SIM.PW, SIM.PW, gl.RGBA32F);
+  SIM.pos0 = P(); SIM.pos1 = P(); SIM.vel0 = P(); SIM.vel1 = P();
+  SIM.mrt = [0, 1].map(i => {                       // g2p writes position and velocity at once
+    const fb = gl.createFramebuffer(); gl.bindFramebuffer(gl.FRAMEBUFFER, fb);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, (i ? SIM.pos0 : SIM.pos1).tex, 0);
+    gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT1, gl.TEXTURE_2D, (i ? SIM.vel0 : SIM.vel1).tex, 0);
+    return fb;
+  });
+  SIM.flipFlop = 0; SIM.np = 0;
+}
+const SCENES = {
+  tank: { label: 'Tank', water: (x, y, z) => y < 0.45 },
+  dam: { label: 'Dam break', water: (x, y, z) => x < 0.35 && y < 0.8 },
+  drop: { label: 'Drop', water: (x, y, z) => y < 0.2 || ((x - 0.5) ** 2 + (y - 0.72) ** 2 + (z - 0.5) ** 2 < 0.18 * 0.18) },
+  corner: { label: 'Corner column', water: (x, y, z) => x < 0.35 && z < 0.35 && y < 0.9 },
+};
+const sceneKeys = Object.keys(SCENES);
+let scene = 'tank';
+function seed() {                                    // 2x2x2 jittered particles per cell wherever the scene has water
+  const { G, PW } = SIM, pos = new Float32Array(PW * PW * 4), vel = new Float32Array(PW * PW * 4), S = SCENES[scene];
+  let n = 0;
+  for (let k = 0; k < G * 2 && n < PW * PW; k++) for (let j = 0; j < G * 2 && n < PW * PW; j++) for (let i = 0; i < G * 2 && n < PW * PW; i++) {
+    const x = (i + 0.25 + 0.5 * Math.random()) / 2, y = (j + 0.25 + 0.5 * Math.random()) / 2, z = (k + 0.25 + 0.5 * Math.random()) / 2;
+    if (!S.water(x / G, y / G, z / G)) continue;
+    pos.set([Math.min(Math.max(x, 0.3), G - 0.3), Math.min(Math.max(y, 0.3), G - 0.3), Math.min(Math.max(z, 0.3), G - 0.3), 1], 4 * n); n++;
+  }
+  SIM.np = n; SIM.flipFlop = 0;
+  for (const [t, d] of [[SIM.pos0, pos], [SIM.vel0, vel]]) { gl.bindTexture(gl.TEXTURE_2D, t.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PW, PW, gl.RGBA, gl.FLOAT, d); }
+  clear(SIM.p0); clear(SIM.p1);
+}
+const curPos = () => SIM.flipFlop ? SIM.pos1 : SIM.pos0, curVel = () => SIM.flipFlop ? SIM.vel1 : SIM.vel0;
+const atlasUniforms = u => { gl.uniform3i(u.N, SIM.N, SIM.N, SIM.N); gl.uniform1i(u.TX, SIM.TX); };
+
+// ----- one simulation step ---------------------------------------------------------------------------
+const stir = { on: false, pos: [0, 0, 0], vel: [0, 0, 0] };
+function step(dt, gWorld) {
+  const { G, np, PW } = SIM;
+  if (!np) return;
+  // 1. particles -> grid
+  gl.bindVertexArray(emptyVAO); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  for (let c = 0; c < 3; c++) {
+    const acc = SIM['acc' + c]; clear(acc);
+    gl.useProgram(PR.p2g.p); unit = 0; const u = PR.p2g.u;
+    bind(u.uPos, curPos()); bind(u.uVel, curVel()); atlasUniforms(u);
+    gl.uniform1i(u.PW, PW); gl.uniform1i(u.comp, c); gl.uniform2f(u.atlasSize, SIM.AW, SIM.AH);
+    for (let k = 0; k < 8; k++) { gl.uniform3i(u.corner, k & 1, (k >> 1) & 1, (k >> 2) & 1); gl.drawArrays(gl.POINTS, 0, np); }
+  }
+  clear(SIM.mark);
+  gl.useProgram(PR.mark.p); unit = 0; bind(PR.mark.u.uPos, curPos()); atlasUniforms(PR.mark.u);
+  gl.uniform1i(PR.mark.u.PW, PW); gl.uniform2f(PR.mark.u.atlasSize, SIM.AW, SIM.AH); gl.drawArrays(gl.POINTS, 0, np);
+  gl.disable(gl.BLEND);
+  draw(PR.normalize, SIM.velOld, u => { atlasUniforms(u); bind(u.uA0, SIM.acc0); bind(u.uA1, SIM.acc1); bind(u.uA2, SIM.acc2); });
+  // 2. forces on the grid (FLIP will hand the particles the difference to velOld)
+  draw(PR.forces, SIM.vel, u => {
+    atlasUniforms(u); bind(u.uVel, SIM.velOld); bind(u.uMark, SIM.mark);
+    gl.uniform3f(u.g, gWorld[0] * G, gWorld[1] * G, gWorld[2] * G); gl.uniform1f(u.dt, dt);
+    gl.uniform1f(u.stirR, stir.on ? 0.12 * G : 0); gl.uniform3f(u.stirPos, ...stir.pos.map(v => v * G)); gl.uniform3f(u.stirVel, ...stir.vel.map(v => v * G * 0.25));
+  });
+  // 3. pressure: warm start from last step, Jacobi
+  draw(PR.divergence, SIM.div, u => { atlasUniforms(u); bind(u.uVel, SIM.vel); bind(u.uMark, SIM.mark); });
+  let pa = SIM.p0, pb = SIM.p1;
+  for (let i = 0; i < cfg.iters; i++) {
+    draw(PR.jacobi, pb, u => { atlasUniforms(u); bind(u.uP, pa); bind(u.uDiv, SIM.div); bind(u.uMark, SIM.mark); });
+    [pa, pb] = [pb, pa];
+  }
+  if (pa !== SIM.p0) [SIM.p0, SIM.p1] = [SIM.p1, SIM.p0];
+  draw(PR.gradient, SIM.velTmp, u => { atlasUniforms(u); bind(u.uVel, SIM.vel); bind(u.uP, SIM.p0); bind(u.uMark, SIM.mark); });
+  [SIM.vel, SIM.velTmp] = [SIM.velTmp, SIM.vel];
+  // 4. grid -> particles, move them
+  const out = SIM.mrt[SIM.flipFlop];
+  gl.useProgram(PR.g2p.p); unit = 0; const u = PR.g2p.u;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, out); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]); gl.viewport(0, 0, PW, PW);
+  atlasUniforms(u); bind(u.uPos, curPos()); bind(u.uVel, curVel()); bind(u.uGrid, SIM.vel); bind(u.uGridOld, SIM.velOld);
+  gl.uniform1f(u.dt, dt); gl.uniform1f(u.flip, cfg.flip); gl.uniform1f(u.np, np); gl.uniform1i(u.PW, PW);
+  gl.bindVertexArray(quadVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  SIM.flipFlop ^= 1;
+}
+
+// ----- camera ----------------------------------------------------------------------------------------
+const cam = { yaw: 0.6, pitch: 0.42, dist: 2.3, fov: 50 * Math.PI / 180, target: [0, 0.38, 0] };
+const v3 = { sub: (a, b) => [a[0] - b[0], a[1] - b[1], a[2] - b[2]], cross: (a, b) => [a[1] * b[2] - a[2] * b[1], a[2] * b[0] - a[0] * b[2], a[0] * b[1] - a[1] * b[0]],
+  norm: a => { const l = Math.hypot(...a); return a.map(x => x / l); }, dot: (a, b) => a[0] * b[0] + a[1] * b[1] + a[2] * b[2] };
+function camera() {
+  const cp = Math.cos(cam.pitch), pos = [cam.target[0] + cam.dist * cp * Math.sin(cam.yaw), cam.target[1] + cam.dist * Math.sin(cam.pitch), cam.target[2] + cam.dist * cp * Math.cos(cam.yaw)];
+  const F = v3.norm(v3.sub(cam.target, pos)), R = v3.norm(v3.cross(F, [0, 1, 0])), U = v3.cross(R, F);
+  const view = [R[0], U[0], -F[0], 0, R[1], U[1], -F[1], 0, R[2], U[2], -F[2], 0, -v3.dot(R, pos), -v3.dot(U, pos), v3.dot(F, pos), 1];
+  const aspect = canvas.width / canvas.height, n = 0.05, f = 20, t = 1 / Math.tan(cam.fov / 2);
+  const proj = [t / aspect, 0, 0, 0, 0, t, 0, 0, 0, 0, (f + n) / (n - f), -1, 0, 0, 2 * f * n / (n - f), 0];
+  return { pos, F, R, U, view, proj, tanHalf: [Math.tan(cam.fov / 2) * aspect, Math.tan(cam.fov / 2)] };
+}
+
+// ----- rendering ---------------------------------------------------------------------------------------
+const RB = {};
+function buildRender() {
+  for (const k of ['depth', 'blurA', 'blurB', 'thick']) if (RB[k]) RB[k].free();
+  const w = Math.max(2, canvas.width >> 1), h = Math.max(2, canvas.height >> 1);    // half resolution: smoother and cheaper
+  RB.depth = target(w, h, gl.R32F, gl.NEAREST, true); RB.blurA = target(w, h, gl.R32F, gl.LINEAR); RB.blurB = target(w, h, gl.R32F, gl.LINEAR);
+  RB.thick = target(w, h, gl.R16F, gl.LINEAR);
+}
+function render() {
+  const C = camera(), { G, np, PW } = SIM, radius = 0.62 / (2 * G);
+  const sprites = (prog, tgt) => {
+    gl.useProgram(prog.p); unit = 0; const u = prog.u;
+    bind(u.uPos, curPos()); gl.uniform1i(u.PW, PW); gl.uniform1i(u.G, G);
+    gl.uniformMatrix4fv(u.uView, false, C.view); gl.uniformMatrix4fv(u.uProj, false, C.proj);
+    gl.uniform1f(u.radius, radius); gl.uniform1f(u.pxScale, tgt.h / Math.tan(cam.fov / 2));
+    gl.bindVertexArray(emptyVAO); gl.drawArrays(gl.POINTS, 0, np);
+  };
+  // 1. nearest sphere surface per pixel
+  gl.bindFramebuffer(gl.FRAMEBUFFER, RB.depth.fb); gl.viewport(0, 0, RB.depth.w, RB.depth.h);
+  gl.clearColor(1e6, 0, 0, 0); gl.clearDepth(1); gl.clear(gl.COLOR_BUFFER_BIT | gl.DEPTH_BUFFER_BIT);
+  gl.enable(gl.DEPTH_TEST); sprites(PR.depth, RB.depth); gl.disable(gl.DEPTH_TEST);
+  // 2. thickness (how much water a ray crosses)
+  clear(RB.thick); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE); sprites(PR.thick, RB.thick); gl.disable(gl.BLEND);
+  // 3. smooth the depth into a surface (two separable bilateral passes, twice)
+  let src = RB.depth;
+  for (let it = 0; it < 2; it++) for (const [dx, dy, dst] of [[1, 0, RB.blurA], [0, 1, RB.blurB]]) {
+    draw(PR.blur, dst, u => { bind(u.uTex, src); gl.uniform2f(u.dir, dx / dst.w, dy / dst.h); gl.uniform1f(u.range, 0.03); });
+    src = dst;
+  }
+  // 4. shade
+  draw(PR.composite, null, u => {
+    bind(u.uDepth, src); bind(u.uThick, RB.thick);
+    gl.uniform3f(u.camPos, ...C.pos); gl.uniform3f(u.camF, ...C.F); gl.uniform3f(u.camR, ...C.R); gl.uniform3f(u.camU, ...C.U);
+    gl.uniform2f(u.tanHalf, ...C.tanHalf); gl.uniform2f(u.texel, 1.5 / src.w, 1.5 / src.h);
+    gl.uniform3f(u.sunDir, ...v3.norm([0.5, 0.8, 0.3]));
+  });
+  return C;
+}
+
+// ----- input -------------------------------------------------------------------------------------------
+let tool = 'orbit';
+const tilt = { on: false, g: [0, -1, 0] };
+const IOS = /iP(hone|ad|od)/.test(navigator.userAgent) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const pointers = new Map();
+let lastCam = camera();
+canvas.addEventListener('pointerdown', e => { e.preventDefault(); try { canvas.setPointerCapture(e.pointerId); } catch (_) {} pointers.set(e.pointerId, { x: e.clientX, y: e.clientY, t: performance.now() }); });
+canvas.addEventListener('pointermove', e => {
+  const p = pointers.get(e.pointerId); if (!p) return; e.preventDefault();
+  const dx = e.clientX - p.x, dy = e.clientY - p.y, now = performance.now(), dt = Math.max(1, now - p.t) / 1000;
+  if (pointers.size >= 2) {                               // two fingers: zoom with the vertical motion
+    cam.dist = Math.min(5, Math.max(1.2, cam.dist * (1 + dy * 0.003)));
+  } else if (tool === 'orbit') {
+    cam.yaw -= dx * 0.008; cam.pitch = Math.min(1.45, Math.max(-0.1, cam.pitch + dy * 0.006));
+  } else {                                                // stir: push the water under the finger
+    const r = canvas.getBoundingClientRect(), u = (e.clientX - r.left) / r.width * 2 - 1, v = 1 - (e.clientY - r.top) / r.height * 2;
+    const C = lastCam, rd = v3.norm([0, 1, 2].map(i => C.F[i] + u * C.tanHalf[0] * C.R[i] + v * C.tanHalf[1] * C.U[i]));
+    const t = v3.dot(v3.sub([0, 0.4, 0], C.pos), C.F) / v3.dot(rd, C.F);      // plane through the tank centre facing the camera
+    const hit = [0, 1, 2].map(i => C.pos[i] + rd[i] * t);
+    const scale = t * 2 * C.tanHalf[1] / r.height;                            // world units per screen pixel at that depth
+    stir.on = true; stir.pos = [hit[0] + 0.5, hit[1], hit[2] + 0.5];
+    stir.vel = [0, 1, 2].map(i => (C.R[i] * dx - C.U[i] * dy) * scale / dt);
+  }
+  p.x = e.clientX; p.y = e.clientY; p.t = now;
+});
+const up = e => { pointers.delete(e.pointerId); if (!pointers.size) stir.on = false; };
+canvas.addEventListener('pointerup', up); canvas.addEventListener('pointercancel', up);
+canvas.addEventListener('wheel', e => { e.preventDefault(); cam.dist = Math.min(5, Math.max(1.2, cam.dist * (1 + e.deltaY * 0.001))); }, { passive: false });
+function onMotion(e) {                                    // full 3D gravity in the phone's frame -> world, through the camera
+  const a = e.accelerationIncludingGravity; if (!a || a.x == null) return;
+  const k = (IOS ? 1 : -1) / 9.8;                          // Android reports the reaction to gravity
+  const s = (screen.orientation && screen.orientation.angle) || window.orientation || 0;
+  let gx = a.x, gy = a.y; const gz = a.z;
+  if (s === 90) [gx, gy] = [-a.y, a.x]; else if (s === 270 || s === -90) [gx, gy] = [a.y, -a.x]; else if (s === 180) [gx, gy] = [-a.x, -a.y];
+  const C = lastCam, dev = [gx * k, gy * k, gz * k];       // device: x right, y up, z out of the screen (towards you)
+  tilt.g = [0, 1, 2].map(i => C.R[i] * dev[0] + C.U[i] * dev[1] - C.F[i] * dev[2]);
+}
+if ('DeviceMotionEvent' in window && matchMedia('(pointer: coarse)').matches) {
+  const b = $('motion'); b.hidden = false;
+  b.onclick = async () => {
+    if (tilt.on) { tilt.on = false; window.removeEventListener('devicemotion', onMotion); b.textContent = 'Tilt: off'; return; }
+    try {
+      if (typeof DeviceMotionEvent.requestPermission === 'function' && (await DeviceMotionEvent.requestPermission()) !== 'granted') return;
+      window.addEventListener('devicemotion', onMotion); tilt.on = true; b.textContent = 'Tilt: on';
+    } catch (_) {}
+  };
+}
+$('reset').onclick = () => seed();
+$('scene').onclick = () => { scene = sceneKeys[(sceneKeys.indexOf(scene) + 1) % sceneKeys.length]; $('scene').textContent = 'Scene: ' + SCENES[scene].label; seed(); };
+$('tool').onclick = () => { tool = tool === 'orbit' ? 'stir' : 'orbit'; $('tool').textContent = 'Drag: ' + (tool === 'orbit' ? 'Orbit' : 'Stir'); };
+$('quality').onclick = () => { cfg.quality = (cfg.quality + 1) % QUALITY.length; $('quality').textContent = 'Quality: ' + QUALITY[cfg.quality].name; buildSim(); seed(); };
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, cfg.maxDpr), w = Math.floor(canvas.clientWidth * dpr), h = Math.floor(canvas.clientHeight * dpr);
+  if (w === canvas.width && h === canvas.height) return;
+  canvas.width = w; canvas.height = h; buildRender();
+}
+window.addEventListener('resize', resize);
+
+// ----- main loop -----------------------------------------------------------------------------------------
+resize(); buildSim(); seed();
+const grav = [0, -1, 0];
+let last = performance.now(), frames = 0, acc = 0;
+function frame(now) {
+  const raw = (now - last) / 1000; last = now;
+  const dt = Math.min(Math.max(raw, 0.001), 1 / 30);
+  const tg = tilt.on ? tilt.g : [0, -1, 0], f = Math.min(1, dt * 8);
+  for (let i = 0; i < 3; i++) grav[i] += (tg[i] - grav[i]) * f;
+  const g = grav.map(x => x * cfg.gravity);
+  for (let s = 0; s < cfg.substeps; s++) step(dt / cfg.substeps, g);
+  lastCam = render();
+  frames++; acc += raw;
+  if (acc > 0.5) { $('stats').textContent = `${Math.round(frames / acc)} fps · ${SIM.np.toLocaleString()} particles · ${SIM.G}³ grid`; frames = 0; acc = 0; }
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+window.sim3d = { SIM, step, render, seed, cfg, cam, setScene: s => { scene = s; seed(); } };
+</script>
+</body>
+</html>
