@@ -92,7 +92,7 @@ const cfg = {
   ...PRESETS.water,
   gravity: 30,        // water mode: screen heights per second² (≈ Earth gravity for a 30 cm tank)
   ballGrowth: 0.25,   // water mode: how fast a held-down water ball grows (screen heights per second)
-  sharpen: 1.06,      // water mode: interface contrast boost per frame
+  sharpen: 1.0,       // grid water: interface contrast boost per frame (only applied where water moves fast). Anything above 1.0 made the resting pool slowly start to boil in tests, so it stays off
   waterAlgo: 'grid',  // 'grid' = Eulerian two-phase solver on the GPU, 'flip' = FLIP particles (CPU)
   flipRatio: 0.9,     // FLIP: 0 = pure PIC (smooth, damped), 1 = pure FLIP (lively, noisier)
   flipIters: 40,      // FLIP: pressure solver sweeps per step
@@ -219,7 +219,7 @@ const FRAG = {
   // Keeps the water surface crisp and holds the water volume constant: the mean fill (uMass,
   // last mip level) is compared with the target and the surface is nudged out/in just enough
   // to cancel the numerical volume loss/gain of advection.
-  sharpen: HEAD + `uniform sampler2D uTex, uMass; uniform float k, target, gain;
+  sharpen: HEAD + VELSRC + `uniform sampler2D uTex, uMass; uniform float k, target, gain;
     void main(){
       float c = clamp(texture(uTex, vUv).x, 0.0, 1.0);
       vec2 m = textureLod(uMass, vec2(0.5), 7.0).xy;
@@ -228,8 +228,12 @@ const FRAG = {
       for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++)
         cb += clamp(texture(uTex, vUv + vec2(float(i), float(j)) * ts).x, 0.0, 1.0);
       float band = 1.0 - abs(2.0 * (cb / 9.0) - 1.0);
-      float delta = clamp((target - m.x) * gain / max(m.y, 0.02), -0.3, 0.3);
-      o = vec4(clamp((c - 0.5) * k + 0.5 + delta * band, 0.0, 1.0), 0.0, 0.0, 1.0);
+      float err = target - m.x; err = abs(err) < 0.004 ? 0.0 : err - sign(err) * 0.004;   // dead band: don't make a resting surface breathe
+      float delta = clamp(err * gain / max(m.y, 0.02), -0.3, 0.3);
+      // only sharpen where the water is actually moving: at rest, sharpening amplifies tiny wobbles into a boil
+      float sp = length(velAt(vUv * gridSize)) / gridSize.y;
+      float kk = 1.0 + (k - 1.0) * smoothstep(0.15, 0.6, sp);
+      o = vec4(clamp((c - 0.5) * kk + 0.5 + delta * band, 0.0, 1.0), 0.0, 0.0, 1.0);
     }`,
 
   // Stamp a solid ball of water (fill fraction -> 1) into the water field.
@@ -244,7 +248,7 @@ const FRAG = {
   phiClamp: HEAD + `uniform sampler2D uTex;
     void main(){ o = vec4(clamp(texture(uTex, vUv).x, 0.0, 1.0), 0.0, 0.0, 1.0); }`,
 
-  fill: HEAD + `void main(){ o = vec4(1.0 - smoothstep(0.38, 0.42, vUv.y), 0.0, 0.0, 1.0); }`,
+  fill: HEAD + `void main(){ o = vec4(1.0 - smoothstep(0.39, 0.41, vUv.y), 0.0, 0.0, 1.0); }`,
 
   // ===== Water: staggered (MAC) grid + two-phase pressure projection =====
   // u lives on vertical cell faces, v on horizontal ones, pressure and the fill fraction in cells.
@@ -431,7 +435,8 @@ const FRAG = {
       vec3 water = bg * T * 1.1 + scatter * (1.0 - T);
 
       vec2 cq = vec2(vUv.x * aspect, vUv.y) * 9.0;                      // caustics, fading with depth
-      float cA = noise(cq + vec2(time * 0.6, time * 0.4)), cB = noise(cq * 1.7 - vec2(time * 0.5, -time * 0.3));
+      cq += grad * 10.0;                                                  // pattern is fixed; waves bend it (nothing moves at rest)
+      float cA = noise(cq), cB = noise(cq * 1.7 + 11.3);
       water += vec3(0.5, 0.85, 1.0) * pow(1.0 - abs(cA - cB), 6.0) * exp(-depth * 4.0) * 0.25;
 
       float edge = length(grad);                                        // surface: bright band, glints, Fresnel
@@ -442,7 +447,7 @@ const FRAG = {
       water += vec3(0.85, 0.95, 1.0) * (spec * 0.9 + fres * smoothstep(0.03, 0.4, edge) * 0.8);
 
       float sp = length(velAt(vUv * gridSize)) / velScale;              // white water: fast flow near the surface
-      float foam = smoothstep(0.5, 1.6, sp) * smoothstep(0.1, 0.0, depth) * (0.4 + 0.6 * noise(vec2(vUv.x * aspect, vUv.y) * 80.0 + time * 3.0));
+      float foam = smoothstep(0.5, 1.6, sp) * smoothstep(0.1, 0.0, depth) * (0.4 + 0.6 * noise(vec2(vUv.x * aspect, vUv.y) * 80.0 + sp * 7.0));
       water = mix(water, vec3(0.9, 0.96, 1.0), clamp(foam, 0.0, 0.85));
 
       vec3 c = mix(backdrop(vUv), water, m);
@@ -648,7 +653,8 @@ class Flip {
     this.nx = nx; this.ny = ny; this.fX = nx + 2; this.fY = ny + 2;     // +1 solid wall cell all around
     const N = this.N = this.fX * this.fY, fX = this.fX, fY = this.fY;
     for (const k of ['u', 'v', 'du', 'dv', 'pu', 'pv', 's', 'dens', 'P']) this[k] = new Float32Array(N);
-    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.k = 1; this.push = 2;   // k: strength of the volume-drift correction
+    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.sleep = 15; this.k = 1; this.push = 2;
+    // sleep: speeds below this (cells/s) are damped so resting water goes completely still; k: strength of the volume-drift correction
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
     this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
@@ -807,7 +813,12 @@ class Flip {
     this.pu.set(this.u); this.pv.set(this.v);          // snapshot before forces: FLIP copies (after - before) back to the particles
     this.addGravity(dt, gx, gy);
     this.updateDensity(); this.solve(iters, dt); this.transfer(false, ratio);
-    for (let i = 0; i < np; i++) { pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt; }
+    for (let i = 0; i < np; i++) {
+      // let nearly-still water go fully still (kills the low-level FLIP jitter) without touching real motion
+      let sp = Math.hypot(vel[2 * i], vel[2 * i + 1]), f = 1;
+      if (sp < this.sleep) { const t = Math.max(0, (sp - this.sleep * 0.2) / (this.sleep * 0.8)); f = 0.3 + 0.7 * t * t * (3 - 2 * t); vel[2 * i] *= f; vel[2 * i + 1] *= f; }
+      pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
+    }
     this.pushApart(this.push);
     for (let i = 0; i < np; i++) {
       let x = pos[2 * i], y = pos[2 * i + 1];
@@ -987,6 +998,7 @@ function stepWater(dt) {
   texUnit = 0; u = use(P.massDown); bindTex(u.uTex, water.read); blit(massTex);
   gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
   texUnit = 0; u = use(P.sharpen, water.read.texel); bindTex(u.uTex, water.read); bindTex(u.uMass, massTex);
+  bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); gl.uniform2f(u.gridSize, W, H);
   gl.uniform1f(u.k, cfg.sharpen); gl.uniform1f(u.target, waterTarget); gl.uniform1f(u.gain, 0.3);
   blit(water.write); water.swap();
 }
