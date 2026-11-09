@@ -3,7 +3,7 @@
 A real-time, GPU-accelerated 2D fluid simulator built to run smoothly in a phone browser.
 
 - **Modes:** *Water* (default) is a body of water in a box: gravity pulls it down, you can stir and splash it, press and hold to grow a water ball and release to drop it in, and tilt the phone to slosh it around. *Dye* is the original coloured-smoke mode. Switch with the Mode button.
-- **Method:** Jos Stam's *Stable Fluids* (semi-Lagrangian advection, projection, vorticity confinement) in WebGL2 fragment shaders with half-float textures. Water mode adds an advected fill-fraction field, gravity, a multigrid pressure solver (so a resting pool stays at rest) and a GPU volume-conservation step so the water level doesn't drift.
+- **Method:** Jos Stam's *Stable Fluids* (semi-Lagrangian advection, projection, vorticity confinement) in WebGL2 fragment shaders with half-float textures. Water mode is a separate solver: a staggered (MAC) grid with a two-phase water/air pressure projection (variable density, multigrid V-cycles), an advected fill-fraction field for the surface and a GPU volume-conservation step so the level doesn't drift. It is drawn with refraction, depth-based light absorption, caustics, Fresnel glints and foam.
 - **Settings:** the Settings button opens sliders for swirliness, damping, dye fade, pressure, brush size, stir force, dye amount, tilt gravity strength, render scale and resolution (with an auto toggle). Values persist in localStorage.
 - **Input:** touch (multi-finger), mouse, optional device tilt (gravity).
 - **Adaptive quality:** the sim/dye resolution and pressure iterations scale up and down automatically to hold ~60 fps; the HUD shows the current fps and grid sizes.

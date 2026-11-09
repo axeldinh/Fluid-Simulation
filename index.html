@@ -79,10 +79,10 @@ const LEVELS = [
   { sim: 192, dye: 1024, iter: 26 },
 ];
 // Two modes share one solver. 'dye' = coloured smoke you splat in. 'water' = a body of water
-// (an advected 0..1 fill fraction) that gravity pulls down and that you can slosh, stir, and grow new blobs of.
+// (an advected 0..1 fill fraction on a staggered grid with a two-phase pressure solve) that gravity pulls down and that you can slosh, stir, and grow new blobs of.
 const PRESETS = {
   dye:   { velocityDissipation: 0.25, densityDissipation: 0.6, pressure: 0.8,  curl: 25, splatRadius: 0.22, splatForce: 6000, dyeIntensity: 0.18 },
-  water: { velocityDissipation: 0.05, densityDissipation: 0.5, pressure: 0.97, curl: 2,  splatRadius: 0.4,  splatForce: 3000, dyeIntensity: 0.18 },
+  water: { velocityDissipation: 0.02, densityDissipation: 0.5, pressure: 0.9,  curl: 0,  splatRadius: 0.4,  splatForce: 3000, dyeIntensity: 0.18 },
 };
 const cfg = {
   mode: 'water',
@@ -92,7 +92,7 @@ const cfg = {
   gravity: 10,        // water mode: screen-heights per second squared
   ballGrowth: 0.25,   // water mode: how fast a held-down water ball grows (screen heights per second)
   sharpen: 1.06,      // water mode: interface contrast boost per frame
-  ink: 0,             // water mode: coloured tracer dye (0 = off, saves GPU time)
+  density: 16,        // water mode: water density relative to air (real life ~800; higher = heavier, stiffer solve)
   swirl: true,
   tiltStrength: 1,    // multiplier for device-tilt gravity
   maxDpr: 1.5,
@@ -112,9 +112,15 @@ void main() {
   gl_Position = vec4(aPosition, 0.0, 1.0);
 }`;
 const HEAD = `#version 300 es
-precision highp float; precision highp sampler2D;
+precision highp float; precision highp int; precision highp sampler2D;
 in vec2 vUv, vL, vR, vT, vB;
 out vec4 o;
+`;
+// Shared GLSL: sampling the staggered face velocities at an arbitrary point p (in cell units).
+const VELSRC = `uniform sampler2D uU, uV; uniform vec2 gridSize;
+vec2 uvU(vec2 p){ return vec2((p.x + 0.5) / (gridSize.x + 1.0), p.y / gridSize.y); }
+vec2 uvV(vec2 p){ return vec2(p.x / gridSize.x, (p.y + 0.5) / (gridSize.y + 1.0)); }
+vec2 velAt(vec2 p){ return vec2(texture(uU, uvU(p)).x, texture(uV, uvV(p)).x); }
 `;
 const FRAG = {
   copy: HEAD + `uniform sampler2D uTex; void main(){ o = textureLod(uTex, vUv, 0.0); }`,
@@ -175,16 +181,6 @@ const FRAG = {
       o = vec4((L + R + B + T - d) * 0.25, 0.0, 0.0, 1.0);
     }`,
 
-  // --- multigrid helpers (water mode): residual, restriction, prolongation ---
-  residual: HEAD + `uniform sampler2D uPressure, uB;
-    void main(){
-      float L = texture(uPressure, vL).x, R = texture(uPressure, vR).x;
-      float T = texture(uPressure, vT).x, B = texture(uPressure, vB).x;
-      float C = texture(uPressure, vUv).x;
-      o = vec4(texture(uB, vUv).x - (L + R + T + B - 4.0 * C), 0.0, 0.0, 1.0);
-    }`,
-  restrict: HEAD + `uniform sampler2D uTex;       // x4: the coarse grid has twice the spacing
-    void main(){ o = vec4(4.0 * texture(uTex, vUv).x, 0.0, 0.0, 1.0); }`,
   prolong: HEAD + `uniform sampler2D uP, uE;
     void main(){ o = vec4(texture(uP, vUv).x + texture(uE, vUv).x, 0.0, 0.0, 1.0); }`,
 
@@ -195,12 +191,6 @@ const FRAG = {
       vec2 v = texture(uVelocity, vUv).xy - 0.5 * vec2(R - L, T - B);
       if (vL.x < 0.0 || vR.x > 1.0) v.x = 0.0;      // solid walls: no flow through the boundary
       if (vB.y < 0.0 || vT.y > 1.0) v.y = 0.0;
-      o = vec4(v, 0.0, 1.0);
-    }`,
-
-  gravity: HEAD + `uniform sampler2D uVelocity, uWater; uniform vec2 g; uniform float dt;
-    void main(){
-      vec2 v = texture(uVelocity, vUv).xy + g * dt * textureLod(uWater, vUv, 0.0).x;
       o = vec4(v, 0.0, 1.0);
     }`,
 
@@ -229,42 +219,207 @@ const FRAG = {
       o = vec4(clamp((c - 0.5) * k + 0.5 + delta * band, 0.0, 1.0), 0.0, 0.0, 1.0);
     }`,
 
-  // Stamp a solid ball into a field: kind 0 = water fill (set to 1), kind 1 = velocity (set to 0).
-  stamp: HEAD + `uniform sampler2D uTex; uniform vec2 point; uniform float aspect, radius, kind;
+  // Stamp a solid ball of water (fill fraction -> 1) into the water field.
+  stampPhi: HEAD + `uniform sampler2D uTex; uniform vec2 point; uniform float aspect, radius;
     void main(){
       vec2 d = vUv - point; d.x *= aspect;
       float inside = 1.0 - smoothstep(radius - 0.006, radius, length(d));
       vec4 t = texture(uTex, vUv);
-      o = kind < 0.5 ? vec4(mix(t.x, 1.0, inside), t.yzw) : vec4(t.xy * (1.0 - inside), t.zw);
+      o = vec4(mix(t.x, 1.0, inside), t.yzw);
     }`,
 
   fill: HEAD + `void main(){ o = vec4(1.0 - smoothstep(0.38, 0.42, vUv.y), 0.0, 0.0, 1.0); }`,
 
-  displayWater: HEAD + `uniform sampler2D uWater, uVelocity, uDye; uniform float velScale, inkOn, aspect; uniform vec3 balls[4];
+  // ===== Water: staggered (MAC) grid + two-phase pressure projection =====
+  // u lives on vertical cell faces, v on horizontal ones, pressure and the fill fraction in cells.
+  phiDown: HEAD + `uniform sampler2D uWater; uniform vec2 cell;
+    void main(){
+      float s = 0.0;
+      for (int i = -1; i <= 1; i++) for (int j = -1; j <= 1; j++)
+        s += clamp(textureLod(uWater, vUv + vec2(float(i), float(j)) * cell * 0.33, 0.0).x, 0.0, 1.0);
+      o = vec4(s / 9.0, 0.0, 0.0, 1.0);
+    }`,
+
+  // Face coefficients beta = 1/density between neighbouring cells (0 at solid walls).
+  beta: HEAD + `uniform sampler2D uPhi; uniform float rhoW;
+    float rho(ivec2 c){ return mix(1.0, rhoW, clamp(texelFetch(uPhi, c, 0).x, 0.0, 1.0)); }
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uPhi, 0);
+      float r = rho(c);
+      float bx = c.x < n.x - 1 ? 2.0 / (r + rho(c + ivec2(1, 0))) : 0.0;
+      float by = c.y < n.y - 1 ? 2.0 / (r + rho(c + ivec2(0, 1))) : 0.0;
+      o = vec4(bx, by, 0.0, 1.0);
+    }`,
+
+  divMAC: HEAD + `uniform sampler2D uU, uV;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      o = vec4(texelFetch(uU, c + ivec2(1, 0), 0).x - texelFetch(uU, c, 0).x
+             + texelFetch(uV, c + ivec2(0, 1), 0).x - texelFetch(uV, c, 0).x, 0.0, 0.0, 1.0);
+    }`,
+
+  // damped Jacobi on  sum_f beta_f (p_n - p) = div
+  jacobiW: HEAD + `uniform sampler2D uP, uD, uB;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      float p = texelFetch(uP, c, 0).x;
+      vec2 b = texelFetch(uB, c, 0).xy;
+      float bL = c.x > 0 ? texelFetch(uB, c - ivec2(1, 0), 0).x : 0.0;
+      float bB = c.y > 0 ? texelFetch(uB, c - ivec2(0, 1), 0).y : 0.0;
+      float sum = b.x + bL + b.y + bB, s = 0.0;
+      if (b.x > 0.0) s += b.x * texelFetch(uP, c + ivec2(1, 0), 0).x;
+      if (bL > 0.0)  s += bL  * texelFetch(uP, c - ivec2(1, 0), 0).x;
+      if (b.y > 0.0) s += b.y * texelFetch(uP, c + ivec2(0, 1), 0).x;
+      if (bB > 0.0)  s += bB  * texelFetch(uP, c - ivec2(0, 1), 0).x;
+      float pj = (s - texelFetch(uD, c, 0).x) / max(sum, 1e-6);
+      o = vec4(p + 0.8 * (pj - p), 0.0, 0.0, 1.0);
+    }`,
+
+  residualW: HEAD + `uniform sampler2D uP, uD, uB;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      float p = texelFetch(uP, c, 0).x;
+      vec2 b = texelFetch(uB, c, 0).xy;
+      float bL = c.x > 0 ? texelFetch(uB, c - ivec2(1, 0), 0).x : 0.0;
+      float bB = c.y > 0 ? texelFetch(uB, c - ivec2(0, 1), 0).y : 0.0;
+      float f = 0.0;
+      if (b.x > 0.0) f += b.x * (texelFetch(uP, c + ivec2(1, 0), 0).x - p);
+      if (bL > 0.0)  f += bL  * (texelFetch(uP, c - ivec2(1, 0), 0).x - p);
+      if (b.y > 0.0) f += b.y * (texelFetch(uP, c + ivec2(0, 1), 0).x - p);
+      if (bB > 0.0)  f += bB  * (texelFetch(uP, c - ivec2(0, 1), 0).x - p);
+      o = vec4(texelFetch(uD, c, 0).x - f, 0.0, 0.0, 1.0);
+    }`,
+
+  restrictResW: HEAD + `uniform sampler2D uR;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy) * 2, n = textureSize(uR, 0);
+      float s = 0.0;
+      for (int i = 0; i < 2; i++) for (int j = 0; j < 2; j++) {
+        ivec2 f = c + ivec2(i, j);
+        if (f.x < n.x && f.y < n.y) s += texelFetch(uR, f, 0).x;
+      }
+      o = vec4(s, 0.0, 0.0, 1.0);
+    }`,
+
+  restrictBetaW: HEAD + `uniform sampler2D uB;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy) * 2, n = textureSize(uB, 0);
+      float bx = 0.0, by = 0.0;
+      ivec2 fx = c + ivec2(1, 0);
+      if (fx.x < n.x) { float a = texelFetch(uB, fx, 0).x; float b2 = fx.y + 1 < n.y ? texelFetch(uB, fx + ivec2(0, 1), 0).x : a; bx = 0.5 * (a + b2); }
+      ivec2 fy = c + ivec2(0, 1);
+      if (fy.y < n.y) { float a = texelFetch(uB, fy, 0).y; float b2 = fy.x + 1 < n.x ? texelFetch(uB, fy + ivec2(1, 0), 0).y : a; by = 0.5 * (a + b2); }
+      o = vec4(bx, by, 0.0, 1.0);
+    }`,
+
+  projectU: HEAD + `uniform sampler2D uU, uP, uB;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uP, 0);
+      if (c.x <= 0 || c.x >= n.x) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
+      float b = texelFetch(uB, c - ivec2(1, 0), 0).x;
+      o = vec4(texelFetch(uU, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(1, 0), 0).x), 0.0, 0.0, 1.0);
+    }`,
+  projectV: HEAD + `uniform sampler2D uV, uP, uB;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uP, 0);
+      if (c.y <= 0 || c.y >= n.y) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
+      float b = texelFetch(uB, c - ivec2(0, 1), 0).y;
+      o = vec4(texelFetch(uV, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(0, 1), 0).x), 0.0, 0.0, 1.0);
+    }`,
+
+  // Semi-Lagrangian advection (midpoint backtrace) of the face velocities by themselves.
+  advectFaces: HEAD + VELSRC + `uniform float dt, damp, kind;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      vec2 p = kind < 0.5 ? vec2(float(c.x), float(c.y) + 0.5) : vec2(float(c.x) + 0.5, float(c.y));
+      vec2 pm = clamp(p - 0.5 * dt * velAt(p), vec2(0.0), gridSize);
+      vec2 p0 = clamp(p - dt * velAt(pm), vec2(0.0), gridSize);
+      float v = kind < 0.5 ? texture(uU, uvU(p0)).x : texture(uV, uvV(p0)).x;
+      bool wall = kind < 0.5 ? (c.x == 0 || c.x == int(gridSize.x)) : (c.y == 0 || c.y == int(gridSize.y));
+      o = vec4(wall ? 0.0 : v / (1.0 + damp * dt), 0.0, 0.0, 1.0);
+    }`,
+
+  forceFaces: HEAD + `uniform sampler2D uTex; uniform vec2 gridSize; uniform float acc, kind;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      bool wall = kind < 0.5 ? (c.x == 0 || c.x == int(gridSize.x)) : (c.y == 0 || c.y == int(gridSize.y));
+      o = vec4(wall ? 0.0 : texelFetch(uTex, c, 0).x + acc, 0.0, 0.0, 1.0);
+    }`,
+
+  // Gaussian push (amount > 0 adds velocity) or, with radius mode, a solid ball that zeroes motion.
+  splatFaces: HEAD + `uniform sampler2D uTex; uniform vec2 gridSize, point; uniform float aspect, radius, kind, amount, stamp;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      vec2 pos = kind < 0.5 ? vec2(float(c.x) / gridSize.x, (float(c.y) + 0.5) / gridSize.y)
+                            : vec2((float(c.x) + 0.5) / gridSize.x, float(c.y) / gridSize.y);
+      vec2 d = pos - point; d.x *= aspect;
+      bool wall = kind < 0.5 ? (c.x == 0 || c.x == int(gridSize.x)) : (c.y == 0 || c.y == int(gridSize.y));
+      float v = texelFetch(uTex, c, 0).x;
+      if (stamp > 0.5) v *= 1.0 - (1.0 - smoothstep(radius - 0.006, radius, length(d)));
+      else v += amount * exp(-dot(d, d) / radius);
+      o = vec4(wall ? 0.0 : v, 0.0, 0.0, 1.0);
+    }`,
+
+  advectPhi: HEAD + VELSRC + `uniform sampler2D uSource; uniform float dt;
+    void main(){
+      vec2 p = vUv * gridSize;
+      vec2 pm = clamp(p - 0.5 * dt * velAt(p), vec2(0.0), gridSize);
+      vec2 p0 = clamp(p - dt * velAt(pm), vec2(0.0), gridSize);
+      o = textureLod(uSource, p0 / gridSize, 0.0);
+    }`,
+
+  displayWater: HEAD + VELSRC + `uniform sampler2D uWater; uniform vec2 gdir; uniform float aspect, time, velScale; uniform vec3 balls[4];
     float W(vec2 uv){ return textureLod(uWater, uv, 0.0).x; }
+    float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
+    float noise(vec2 p){
+      vec2 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+      return mix(mix(hash(i), hash(i + vec2(1.0, 0.0)), f.x), mix(hash(i + vec2(0.0, 1.0)), hash(i + vec2(1.0, 1.0)), f.x), f.y);
+    }
+    // the tank's back wall: soft gradient, faint tile grid (this is what the water refracts)
+    vec3 backdrop(vec2 uv){
+      vec2 q = vec2(uv.x * aspect, uv.y);
+      vec3 base = mix(vec3(0.05, 0.07, 0.10), vec3(0.20, 0.25, 0.32), smoothstep(0.0, 1.0, uv.y * 0.7 + 0.15));
+      vec2 g = abs(fract(q * 7.0) - 0.5);
+      base += 0.06 * smoothstep(0.47, 0.5, max(g.x, g.y));
+      return base * (0.8 + 0.3 * smoothstep(1.1, 0.2, length(uv - vec2(0.5, 0.6))));
+    }
     void main(){
       vec2 ts = vec2(vR.x - vUv.x, vT.y - vUv.y);
+      vec2 up = vec2(-gdir.x / aspect, -gdir.y);                       // uv direction pointing away from gravity
       float w = W(vUv);
-      vec2 s = ts * 3.0;
-      vec2 grad = vec2(W(vUv + vec2(s.x, 0.0)) - W(vUv - vec2(s.x, 0.0)),
-                       W(vUv + vec2(0.0, s.y)) - W(vUv - vec2(0.0, s.y)));
-      // how much water surrounds this pixel -> fake depth shading
-      vec2 r = ts * 18.0;
-      float d = w + W(vUv + vec2(r.x, 0.0)) + W(vUv - vec2(r.x, 0.0)) + W(vUv + vec2(0.0, r.y)) + W(vUv - vec2(0.0, r.y))
-                  + W(vUv + r * 0.7071) + W(vUv - r * 0.7071) + W(vUv + vec2(r.x, -r.y) * 0.7071) + W(vUv + vec2(-r.x, r.y) * 0.7071);
-      d /= 9.0;
-      float m = smoothstep(0.3, 0.7, w);
-      vec3 col = mix(vec3(0.22, 0.66, 0.96), vec3(0.02, 0.12, 0.40), smoothstep(0.35, 1.0, d));
-      float sp = length(texture(uVelocity, vUv).xy) / velScale;       // fast water gets foamy
-      col += vec3(0.8, 0.95, 1.0) * smoothstep(0.6, 2.0, sp) * 0.5;
-      float edge = length(grad);                                      // surface edge: rim light + glint
-      vec3 n = normalize(vec3(-grad * 6.0, 1.0));
-      float spec = pow(max(dot(n, normalize(vec3(-0.35, 0.55, 0.75))), 0.0), 24.0) * smoothstep(0.02, 0.25, edge);
-      col += vec3(0.5, 0.8, 1.0) * smoothstep(0.05, 0.5, edge) * 0.35 + vec3(spec * 0.8);
-      if (inkOn > 0.5) col += texture(uDye, vUv).rgb * 2.5;
-      vec3 air = mix(vec3(0.03, 0.05, 0.09), vec3(0.09, 0.13, 0.21), vUv.y);
-      vec3 c = mix(air, col, m);
-      for (int i = 0; i < 4; i++) {                                  // growing water balls being held down
+      float s = (w * 4.0 + W(vUv + vec2(ts.x * 1.5, 0.0)) + W(vUv - vec2(ts.x * 1.5, 0.0))
+                         + W(vUv + vec2(0.0, ts.y * 1.5)) + W(vUv - vec2(0.0, ts.y * 1.5))) / 8.0;
+      vec2 g2 = ts * 4.0;
+      vec2 grad = vec2(W(vUv + vec2(g2.x, 0.0)) - W(vUv - vec2(g2.x, 0.0)), W(vUv + vec2(0.0, g2.y)) - W(vUv - vec2(0.0, g2.y)));
+      float m = smoothstep(0.3, 0.7, s);
+
+      float depth = w * 0.004, prev = 0.0;                              // how much water lies above this pixel
+      for (int i = 1; i <= 12; i++) {
+        float t = 0.01 * float(i) * (1.0 + 0.4 * float(i));
+        depth += W(vUv + up * t) * (t - prev); prev = t;
+      }
+      vec3 bg = backdrop(vUv + grad * 0.03);                            // refracted view of the back wall
+      vec3 T = exp(-vec3(5.0, 1.6, 0.9) * depth);                      // Beer-Lambert: red dies first
+      vec3 scatter = vec3(0.02, 0.30, 0.45) * (0.35 + 0.65 * exp(-depth * 2.0));
+      vec3 water = bg * T * 1.1 + scatter * (1.0 - T);
+
+      vec2 cq = vec2(vUv.x * aspect, vUv.y) * 9.0;                      // caustics, fading with depth
+      float cA = noise(cq + vec2(time * 0.6, time * 0.4)), cB = noise(cq * 1.7 - vec2(time * 0.5, -time * 0.3));
+      water += vec3(0.5, 0.85, 1.0) * pow(1.0 - abs(cA - cB), 6.0) * exp(-depth * 4.0) * 0.25;
+
+      float edge = length(grad);                                        // surface: bright band, glints, Fresnel
+      water += vec3(0.35, 0.65, 0.8) * exp(-depth * 90.0) * 0.35;
+      vec3 n = normalize(vec3(-grad * 5.0, 1.0));
+      float spec = pow(max(dot(n, normalize(vec3(-0.35, 0.55, 0.75))), 0.0), 40.0) * smoothstep(0.02, 0.2, edge);
+      float fres = 0.04 + 0.96 * pow(1.0 - n.z, 4.0);
+      water += vec3(0.85, 0.95, 1.0) * (spec * 0.9 + fres * smoothstep(0.03, 0.4, edge) * 0.8);
+
+      float sp = length(velAt(vUv * gridSize)) / velScale;              // white water: fast flow near the surface
+      float foam = smoothstep(0.5, 1.6, sp) * smoothstep(0.1, 0.0, depth) * (0.4 + 0.6 * noise(vec2(vUv.x * aspect, vUv.y) * 80.0 + time * 3.0));
+      water = mix(water, vec3(0.9, 0.96, 1.0), clamp(foam, 0.0, 0.85));
+
+      vec3 c = mix(backdrop(vUv), water, m);
+      for (int i = 0; i < 4; i++) {                                     // growing water balls being held down
         if (balls[i].z <= 0.0) continue;
         vec2 d = vUv - balls[i].xy; d.x *= aspect;
         float r = length(d), inside = 1.0 - smoothstep(balls[i].z - 0.004, balls[i].z, r);
@@ -363,7 +518,7 @@ function resizeDouble(old, w, h, filter, mips = false) {
   return n;
 }
 
-let velocity, dye, water, massTex, divergence, curl, pressure, mg = [];
+let velocity, dye, water, massTex, divergence, curl, pressure;
 function gridSize(res) {
   let a = canvas.width / canvas.height; if (a < 1) a = 1 / a;
   const lo = Math.round(res), hi = Math.round(res * a);
@@ -383,38 +538,48 @@ function initBuffers() {
   divergence = makeFBO(sw, sh, gl.NEAREST);
   curl = makeFBO(sw, sh, gl.NEAREST);
   pressure = makeDouble(sw, sh, gl.NEAREST);
-  buildMultigrid(sw, sh);
+  buildWater(sw, sh);
 }
-// Multigrid pressure solver. Plain Jacobi needs ~N^2 sweeps to settle a hydrostatic pressure field,
-// which is why water would otherwise drain/compress. Coarse grids carry the long-range pressure
-// cheaply; level 0 reuses the normal pressure/divergence buffers.
-function buildMultigrid(w, h) {
-  mg.forEach((l, i) => { if (i > 0) { l.p.destroy(); l.b.destroy(); } l.r.destroy(); });
-  mg = [{ w, h, p: pressure, b: divergence, r: makeFBO(w, h, gl.LINEAR) }];
-  while (mg.length < 5 && Math.min(w, h) > 12) {
+// ----- water solver ----------------------------------------------------------
+// Staggered (MAC) grid, two phases. Pressure is solved from  div(beta grad p) = div u  with
+// beta = 1/density, so water (heavy) and air (light) behave like themselves: water falls and
+// slides as one mass and air simply gets out of the way. A multigrid V-cycle with the same
+// variable coefficients handles the long-range (hydrostatic) pressure cheaply.
+const WS = {};
+function buildWater(w, h) {
+  if (WS.U) { WS.U.destroy(); WS.V.destroy(); WS.phi.destroy(); WS.lv.forEach(l => { l.p.destroy(); l.d.destroy(); l.b.destroy(); l.r.destroy(); }); }
+  WS.grid = [w, h];
+  WS.U = makeDouble(w + 1, h, gl.LINEAR); WS.V = makeDouble(w, h + 1, gl.LINEAR);
+  WS.phi = makeFBO(w, h, gl.LINEAR);
+  WS.lv = [];
+  for (;;) {
+    WS.lv.push({ w, h, p: makeDouble(w, h, gl.LINEAR), d: makeFBO(w, h, gl.LINEAR), b: makeFBO(w, h, gl.LINEAR), r: makeFBO(w, h, gl.LINEAR) });
+    if (WS.lv.length >= 7 || Math.min(w, h) <= 5) break;
     w = Math.ceil(w / 2); h = Math.ceil(h / 2);
-    mg.push({ w, h, p: makeDouble(w, h, gl.LINEAR), b: makeFBO(w, h, gl.LINEAR), r: makeFBO(w, h, gl.LINEAR) });
   }
 }
-function smooth(l, n) {
-  const L = mg[l], u = use(P.pressure, [1 / L.w, 1 / L.h]);
+function wsmooth(l, n) {
+  const L = WS.lv[l]; texUnit = 0; const u = use(P.jacobiW);
   for (let i = 0; i < n; i++) {
-    texUnit = 0; bindTex(u.uDivergence, L.b); bindTex(u.uPressure, L.p.read);
+    texUnit = 0; bindTex(u.uD, L.d); bindTex(u.uB, L.b); bindTex(u.uP, L.p.read);
     blit(L.p.write); L.p.swap();
   }
 }
-function vcycle(l, pre, post) {
-  const L = mg[l];
-  if (l === mg.length - 1) { smooth(l, 30); return; }
-  smooth(l, pre);
-  texUnit = 0; let u = use(P.residual, [1 / L.w, 1 / L.h]); bindTex(u.uPressure, L.p.read); bindTex(u.uB, L.b); blit(L.r);
-  const C = mg[l + 1];
-  texUnit = 0; u = use(P.restrict); bindTex(u.uTex, L.r); blit(C.b);
-  for (const f of [C.p.read, C.p.write]) { gl.bindFramebuffer(gl.FRAMEBUFFER, f.fbo); gl.viewport(0, 0, f.w, f.h); gl.clear(gl.COLOR_BUFFER_BIT); }
-  vcycle(l + 1, pre, post);
+function clearFB(f) { gl.bindFramebuffer(gl.FRAMEBUFFER, f.fbo); gl.viewport(0, 0, f.w, f.h); gl.clear(gl.COLOR_BUFFER_BIT); }
+function wvcycle(l, pre, post) {
+  const L = WS.lv[l];
+  if (l === WS.lv.length - 1) { wsmooth(l, 20); return; }
+  wsmooth(l, pre);
+  texUnit = 0; let u = use(P.residualW); bindTex(u.uD, L.d); bindTex(u.uB, L.b); bindTex(u.uP, L.p.read); blit(L.r);
+  const C = WS.lv[l + 1];
+  texUnit = 0; u = use(P.restrictResW); bindTex(u.uR, L.r); blit(C.d);
+  clearFB(C.p.read); clearFB(C.p.write);
+  wvcycle(l + 1, pre, post);
   texUnit = 0; u = use(P.prolong); bindTex(u.uP, L.p.read); bindTex(u.uE, C.p.read); blit(L.p.write); L.p.swap();
-  smooth(l, post);
+  wsmooth(l, post);
 }
+function clearWaterFlow() { [WS.U, WS.V, WS.lv[0].p].forEach(d => { clearFB(d.read); clearFB(d.write); }); }
+
 function resizeCanvas() {
   const dpr = Math.min(window.devicePixelRatio || 1, cfg.maxDpr);
   const w = Math.max(2, Math.floor(canvas.clientWidth * dpr)), h = Math.max(2, Math.floor(canvas.clientHeight * dpr));
@@ -442,28 +607,15 @@ function step(dt) {
   gl.uniform1f(u.curl, cfg.swirl ? cfg.curl : 0); gl.uniform1f(u.dt, dt);
   blit(velocity.write); velocity.swap();
 
-  const isWater = cfg.mode === 'water';
-  const iters = L.iter;
-  if (isWater) {
-    const g = cfg.gravity * velocity.read.h * (tilt.on ? cfg.tiltStrength : 1);
-    texUnit = 0; u = use(P.gravity);
-    bindTex(u.uVelocity, velocity.read); bindTex(u.uWater, water.read);
-    gl.uniform2f(u.g, grav.x * g, grav.y * g); gl.uniform1f(u.dt, dt);
-    blit(velocity.write); velocity.swap();
-  }
-
   texUnit = 0; u = use(P.divergence, vt); bindTex(u.uVelocity, velocity.read); blit(divergence);
 
   texUnit = 0; u = use(P.clear); bindTex(u.uTex, pressure.read); gl.uniform1f(u.value, cfg.pressure);
   blit(pressure.write); pressure.swap();
 
-  if (isWater) { vcycle(0, 3, 3); vcycle(0, 2, 2); }
-  else {
-    u = use(P.pressure, vt);
-    for (let i = 0; i < iters; i++) {
-      texUnit = 0; bindTex(u.uDivergence, divergence); bindTex(u.uPressure, pressure.read);
-      blit(pressure.write); pressure.swap();
-    }
+  u = use(P.pressure, vt);
+  for (let i = 0; i < L.iter; i++) {
+    texUnit = 0; bindTex(u.uDivergence, divergence); bindTex(u.uPressure, pressure.read);
+    blit(pressure.write); pressure.swap();
   }
 
   texUnit = 0; u = use(P.gradient, vt); bindTex(u.uPressure, pressure.read); bindTex(u.uVelocity, velocity.read);
@@ -474,37 +626,67 @@ function step(dt) {
   gl.uniform1f(u.dt, dt); gl.uniform1f(u.dissipation, cfg.velocityDissipation);
   blit(velocity.write); velocity.swap();
 
-  if (!isWater || cfg.ink > 0) {
-    texUnit = 0; u = use(P.advection, vt);
-    bindTex(u.uVelocity, velocity.read); bindTex(u.uSource, dye.read);
-    gl.uniform1f(u.dt, dt); gl.uniform1f(u.dissipation, cfg.densityDissipation);
-    blit(dye.write); dye.swap();
+  texUnit = 0; u = use(P.advection, vt);
+  bindTex(u.uVelocity, velocity.read); bindTex(u.uSource, dye.read);
+  gl.uniform1f(u.dt, dt); gl.uniform1f(u.dissipation, cfg.densityDissipation);
+  blit(dye.write); dye.swap();
+}
+
+function stepWater(dt) {
+  const [W, H] = WS.grid, L0 = WS.lv[0];
+  let u;
+  // fill fraction at simulation resolution
+  texUnit = 0; u = use(P.phiDown); bindTex(u.uWater, water.read); gl.uniform2f(u.cell, 1 / W, 1 / H); blit(WS.phi);
+
+  // advect the face velocities (both read the old fields, then swap)
+  for (const kind of [0, 1]) {
+    texUnit = 0; u = use(P.advectFaces); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read);
+    gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, dt); gl.uniform1f(u.damp, cfg.velocityDissipation); gl.uniform1f(u.kind, kind);
+    blit(kind ? WS.V.write : WS.U.write);
+  }
+  WS.U.swap(); WS.V.swap();
+
+  // gravity acts on everything equally; the pressure solve is what makes water and air differ
+  const gm = cfg.gravity * H * (tilt.on ? cfg.tiltStrength : 1) * dt;
+  for (const [kind, acc, T] of [[0, grav.x * gm, WS.U], [1, grav.y * gm, WS.V]]) {
+    texUnit = 0; u = use(P.forceFaces); bindTex(u.uTex, T.read);
+    gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.acc, acc); gl.uniform1f(u.kind, kind);
+    blit(T.write); T.swap();
   }
 
-  if (isWater) {
-    texUnit = 0; u = use(P.advection, vt);
-    bindTex(u.uVelocity, velocity.read); bindTex(u.uSource, water.read);
-    gl.uniform1f(u.dt, dt); gl.uniform1f(u.dissipation, 0);
-    blit(water.write); water.swap();
-    // advection smears the surface and loses volume; re-sharpen and re-balance the volume.
-    // First measure the current volume: downsample into a 128x128 power-of-two texture whose
-    // mip chain's last level is then exactly the mean (no CPU readback).
-    texUnit = 0; u = use(P.massDown); bindTex(u.uTex, water.read); blit(massTex);
-    gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
-    texUnit = 0; u = use(P.sharpen, water.read.texel); bindTex(u.uTex, water.read); bindTex(u.uMass, massTex);
-    gl.uniform1f(u.k, cfg.sharpen); gl.uniform1f(u.target, waterTarget); gl.uniform1f(u.gain, 0.3);
-    blit(water.write); water.swap();
-  }
+  // pressure projection with density-dependent coefficients
+  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.rhoW, cfg.density); blit(L0.b);
+  for (let l = 0; l + 1 < WS.lv.length; l++) { texUnit = 0; u = use(P.restrictBetaW); bindTex(u.uB, WS.lv[l].b); blit(WS.lv[l + 1].b); }
+  texUnit = 0; u = use(P.divMAC); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); blit(L0.d);
+  texUnit = 0; u = use(P.clear); bindTex(u.uTex, L0.p.read); gl.uniform1f(u.value, cfg.pressure); blit(L0.p.write); L0.p.swap();
+  wvcycle(0, 3, 3); wvcycle(0, 2, 2);
+  texUnit = 0; u = use(P.projectU); bindTex(u.uU, WS.U.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); blit(WS.U.write);
+  texUnit = 0; u = use(P.projectV); bindTex(u.uV, WS.V.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); blit(WS.V.write);
+  WS.U.swap(); WS.V.swap();
+
+  // move the water with the new velocity
+  texUnit = 0; u = use(P.advectPhi); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); bindTex(u.uSource, water.read);
+  gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, dt); blit(water.write); water.swap();
+  // advection smears the surface and loses volume; re-sharpen and re-balance the volume.
+  // First measure the current volume: downsample into a 128x128 power-of-two texture whose
+  // mip chain's last level is then exactly the mean (no CPU readback).
+  texUnit = 0; u = use(P.massDown); bindTex(u.uTex, water.read); blit(massTex);
+  gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
+  texUnit = 0; u = use(P.sharpen, water.read.texel); bindTex(u.uTex, water.read); bindTex(u.uMass, massTex);
+  gl.uniform1f(u.k, cfg.sharpen); gl.uniform1f(u.target, waterTarget); gl.uniform1f(u.gain, 0.3);
+  blit(water.write); water.swap();
 }
 
 function render() {
   if (cfg.mode === 'water') {
+    const [W, H] = WS.grid;
     texUnit = 0; const w = use(P.displayWater, water.read.texel);
-    bindTex(w.uWater, water.read); bindTex(w.uVelocity, velocity.read); bindTex(w.uDye, dye.read);
+    bindTex(w.uWater, water.read); bindTex(w.uU, WS.U.read); bindTex(w.uV, WS.V.read);
     const bd = new Float32Array(12); let bi = 0;
     for (const p of pointers.values()) if (p.hold && p.hold.on && p.hold.r > 0 && bi < 4) { bd.set([p.x, p.y, p.hold.r], bi * 3); bi++; }
     gl.uniform3fv(w['balls[0]'], bd); gl.uniform1f(w.aspect, canvas.width / canvas.height);
-    gl.uniform1f(w.velScale, velocity.read.h); gl.uniform1f(w.inkOn, cfg.ink > 0 ? 1 : 0);
+    gl.uniform2f(w.gridSize, W, H); gl.uniform2f(w.gdir, grav.x, grav.y);
+    gl.uniform1f(w.time, performance.now() / 1000); gl.uniform1f(w.velScale, H);
     blit(null); return;
   }
   texUnit = 0; const u = use(P.display, dye.read.texel);
@@ -513,11 +695,15 @@ function render() {
 
 // Drop a solid ball of water into the simulation, replacing whatever was there (and its motion).
 function stampBall(x, y, r) {
-  const aspect = canvas.width / canvas.height;
-  for (const [kind, target] of [[0, water], [1, velocity]]) {
-    texUnit = 0; const u = use(P.stamp); bindTex(u.uTex, target.read);
-    gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect); gl.uniform1f(u.radius, r); gl.uniform1f(u.kind, kind);
-    blit(target.write); target.swap();
+  const aspect = canvas.width / canvas.height, [W, H] = WS.grid;
+  texUnit = 0; let u = use(P.stampPhi); bindTex(u.uTex, water.read);
+  gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect); gl.uniform1f(u.radius, r);
+  blit(water.write); water.swap();
+  for (const [kind, T] of [[0, WS.U], [1, WS.V]]) {           // a freshly made ball starts at rest
+    texUnit = 0; u = use(P.splatFaces); bindTex(u.uTex, T.read);
+    gl.uniform2f(u.gridSize, W, H); gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect);
+    gl.uniform1f(u.radius, r); gl.uniform1f(u.kind, kind); gl.uniform1f(u.amount, 0); gl.uniform1f(u.stamp, 1);
+    blit(T.write); T.swap();
   }
   // The volume changed, so re-measure it and make that the new volume to conserve.
   texUnit = 0; use(P.massDown); bindTex(P.massDown.u.uTex, water.read); blit(massTex);
@@ -540,9 +726,18 @@ function splatInto(target, x, y, a, b, c, radius) {
 function splatRadius() { const aspect = canvas.width / canvas.height; return (cfg.splatRadius / 100) * (aspect > 1 ? aspect : 1); }
 function splat(x, y, dx, dy, color) {
   const radius = splatRadius();
+  if (cfg.mode === 'water') {
+    const [W, H] = WS.grid, aspect = canvas.width / canvas.height;
+    for (const [kind, amount, T] of [[0, dx, WS.U], [1, dy, WS.V]]) {
+      texUnit = 0; const u = use(P.splatFaces); bindTex(u.uTex, T.read);
+      gl.uniform2f(u.gridSize, W, H); gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect);
+      gl.uniform1f(u.radius, radius); gl.uniform1f(u.kind, kind); gl.uniform1f(u.amount, amount); gl.uniform1f(u.stamp, 0);
+      blit(T.write); T.swap();
+    }
+    return;
+  }
   splatInto(velocity, x, y, dx, dy, 0, radius);
-  if (cfg.mode !== 'water') splatInto(dye, x, y, color[0], color[1], color[2], radius);
-  else if (cfg.ink > 0) splatInto(dye, x, y, color[0] * cfg.ink * 5, color[1] * cfg.ink * 5, color[2] * cfg.ink * 5, radius);
+  splatInto(dye, x, y, color[0], color[1], color[2], radius);
 }
 function hsv(h, s, v) {
   const i = Math.floor(h * 6), f = h * 6 - i, p = v * (1 - s), q = v * (1 - f * s), t = v * (1 - (1 - f) * s);
@@ -643,8 +838,7 @@ function applyTilt(dt) {
     splatInto(velocity, x, y, tilt.gx * f * 0.02, tilt.gy * f * 0.02, 0, 0.35);
 }
 
-$('clear').onclick = () => { [velocity, dye, pressure, water].forEach(d => { for (const f of [d.read, d.write]) {
-  gl.bindFramebuffer(gl.FRAMEBUFFER, f.fbo); gl.viewport(0, 0, f.w, f.h); gl.clear(gl.COLOR_BUFFER_BIT); } }); fillWater(); };
+$('clear').onclick = () => { [velocity, dye, pressure, water].forEach(d => { clearFB(d.read); clearFB(d.write); }); clearWaterFlow(); fillWater(); };
 function setMode(m, fromPreset = true) {
   cfg.mode = m; if (fromPreset) Object.assign(cfg, PRESETS[m]);
   $('mode').textContent = 'Mode: ' + (m === 'water' ? 'Water' : 'Dye');
@@ -666,12 +860,12 @@ const SCHEMA = [
   { k: 'dyeIntensity', label: 'Dye amount', min: 0.02, max: 0.6, step: 0.01 },
   { k: 'gravity', label: 'Water gravity', min: 0, max: 40, step: 0.5 },
   { k: 'ballGrowth', label: 'Water ball growth speed', min: 0.05, max: 1, step: 0.05 },
-  { k: 'ink', label: 'Ink trace (water mode)', min: 0, max: 1, step: 0.05 },
+  { k: 'density', label: 'Water density (vs air)', min: 2, max: 60, step: 1 },
   { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1 },
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg2';
+const KEY = 'fluidCfg3';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
@@ -734,7 +928,8 @@ function frame(now) {
     randomSplat(0.8); nextAuto = now + 1200 + Math.random() * 1500;
   }
   updateGravity(dt); applyPointers(dt); applyTilt(dt);
-  step(dt); render();
+  if (cfg.mode === 'water') stepWater(dt); else step(dt);
+  render();
   if (raw < 0.5) adapt(raw);              // ignore tab-switch hiccups
   requestAnimationFrame(frame);
 }
