@@ -1243,6 +1243,95 @@ function formatSweep(r) {
   return [`GPU: ${r.gpu}`, `canvas ${r.canvas.join('x')}, ${r.cores ?? '?'} cores`, '', 'level sim/surf   grid ms  fps    flip ms  fps  parts', ...rows, '',
     `60 fps (p95): Grid ${rec(r.recommended.grid)}, FLIP ${rec(r.recommended.flip)}`].join('\n');
 }
+// ---- accuracy: compare with analytic physics ------------------------------------------
+// Three textbook results the simulation can be held against (all lengths in screen heights):
+//  1. Hydrostatics: a resting pool of depth h has bottom pressure  rho*g*h  and a flat, motionless surface.
+//  2. Linear wave theory: the first sloshing mode of a tank of width L has  w^2 = g*k*tanh(k*h),  k = pi/L
+//     (for two fluids, e.g. water under air:  w^2 = g*k*(rw-ra) / (rw*coth(kh) + ra*coth(k*h_air))).
+//  3. Volume conservation.
+// These are not lab experiments, but exact solutions of the equations real water obeys.
+function benchColumns() {                          // water depth (in screen heights) near the left and right walls, and the mean
+  texUnit = 0; use(P.massDown); bindTex(P.massDown.u.uTex, water.read); blit(massTex);
+  const a = readRGBA(massTex), n = massTex.w; let l = 0, r = 0, m = 0;
+  for (let y = 0; y < n; y++) {
+    for (let x = 0; x < n; x++) m += a[(y * n + x) * 4];
+    for (let x = 0; x < 3; x++) { l += a[(y * n + x) * 4]; r += a[(y * n + n - 1 - x) * 4]; }
+  }
+  return { left: l / (3 * n), right: r / (3 * n), mean: m / (n * n) };
+}
+function floorPressure(algo, dt) {                 // pressure at the bottom minus pressure at the top, in the solver's units
+  if (algo === 'flip') {
+    const f = FL.sim; let s = 0, c = 0;
+    for (let i = 3; i < f.fX - 3; i++) { s += f.P[i * f.fY + 1]; c++; }
+    return { value: s / c, dt: f.lastDt, g: cfg.gravity * f.ny, cells: f.ny };
+  }
+  const L = WS.lv[0], a = readRGBA(L.p.read); let bot = 0, top = 0, c = 0;
+  for (let x = 2; x < L.w - 2; x++) { bot += a[x * 4]; top += a[((L.h - 1) * L.w + x) * 4]; c++; }
+  return { value: (bot - top) / c, dt, g: cfg.gravity * L.h, cells: L.h };
+}
+function periodFromSeries(eta, dt) {               // mean spacing of zero crossings x 2
+  const mean = avg(eta), x = eta.map(v => v - mean), cr = [];
+  for (let i = 1; i < x.length; i++) if (x[i - 1] * x[i] < 0) cr.push(i - 1 + x[i - 1] / (x[i - 1] - x[i]));
+  if (cr.length < 3) return null;
+  return 2 * (cr[cr.length - 1] - cr[0]) / (cr.length - 1) * dt;
+}
+async function theoryAlgo(algo, progress) {
+  setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
+  const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, aspect = canvas.width / canvas.height;
+  progress(`${algo}: settling…`);
+  for (let i = 0; i < 150; i++) { run(dt); if (i % 10 === 9) await yieldUI(); }
+  const rest = benchColumns(), speedRest = benchSpeed(algo), h = rest.mean;
+  // 1. hydrostatics
+  const fp = floorPressure(algo, dt), ratio = algo === 'grid' ? Math.min(cfg.density, CAN_F32 ? 2000 : 30) : Infinity;
+  const hc = h * fp.cells, expectedP = fp.g * fp.dt * (hc + (fp.cells - hc) / ratio);
+  // 2. sloshing: tilt gravity for a moment, put it back, then watch the surface swing between the walls
+  progress(`${algo}: sloshing…`);
+  const eta = [], vol = [];
+  for (let i = 0; i < 18; i++) { grav.x = 0.12; grav.y = -Math.sqrt(1 - 0.12 * 0.12); run(dt); }
+  grav.x = 0; grav.y = -1;
+  for (let i = 0; i < 200; i++) {
+    run(dt); const c = benchColumns(); eta.push((c.left - c.right) / 2); vol.push(c.mean);
+    if (i % 10 === 9) { progress(`${algo}: sloshing ${Math.round(i / 2)}%`); await yieldUI(); }
+  }
+  const k = Math.PI / aspect, g = cfg.gravity, kh = k * h;
+  const w2one = g * k * Math.tanh(kh);
+  const ra = 1 / (algo === 'grid' ? ratio : 1e9), w2two = g * k * (1 - ra) / (1 / Math.tanh(kh) + ra / Math.tanh(k * (1 - h)));
+  const Tth = 2 * Math.PI / Math.sqrt(algo === 'grid' ? w2two : w2one), Tms = periodFromSeries(eta, dt);
+  const amp = a => Math.max(...a.map(Math.abs));
+  return {
+    algorithm: algo, tankWidthInHeights: +aspect.toFixed(3),
+    level: { expected: FILL_LEVEL, measured: +h.toFixed(4) },
+    restSpeed: +speedRest.toFixed(4),
+    bottomPressure: { expected: +expectedP.toFixed(2), measured: +fp.value.toFixed(2) },
+    sloshPeriodSeconds: { theory: +Tth.toFixed(3), singleFluidTheory: +(2 * Math.PI / Math.sqrt(w2one)).toFixed(3), measured: Tms === null ? null : +Tms.toFixed(3) },
+    sloshDecay: { firstQuarter: +amp(eta.slice(0, 50)).toFixed(4), lastQuarter: +amp(eta.slice(150)).toFixed(4) },
+    volumeDriftPercent: +(100 * (vol[vol.length - 1] - vol[0]) / vol[0]).toFixed(2),
+  };
+}
+async function runTheory(progress = () => {}) {
+  const saved = { algo: cfg.waterAlgo, auto: cfg.auto };
+  bench.on = true; cfg.auto = false;
+  const out = { when: new Date().toISOString(), level: cfg.level, settings: { gravity: cfg.gravity, density: cfg.density, flipRatio: cfg.flipRatio, flipIters: cfg.flipIters }, results: {} };
+  try { for (const algo of ['grid', 'flip']) out.results[algo] = await theoryAlgo(algo, progress); }
+  finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
+  window.theoryResult = out; return out;
+}
+function formatTheory(r) {
+  const e = (th, m) => (th && m !== null && isFinite(m)) ? ((100 * (m - th) / th) >= 0 ? '+' : '') + (100 * (m - th) / th).toFixed(1) + '%' : 'n/a';
+  const f = x => x === null || x === undefined ? 'n/a' : x;
+  const rows = [];
+  for (const algo of ['grid', 'flip']) {
+    const a = r.results[algo];
+    rows.push(`${algo.toUpperCase()}  (tank ${a.tankWidthInHeights} heights wide)`,
+      `  water level      expected ${a.level.expected}  measured ${a.level.measured}  ${e(a.level.expected, a.level.measured)}`,
+      `  bottom pressure  expected ${a.bottomPressure.expected}  measured ${a.bottomPressure.measured}  ${e(a.bottomPressure.expected, a.bottomPressure.measured)}`,
+      `  sloshing period  theory ${a.sloshPeriodSeconds.theory} s  measured ${f(a.sloshPeriodSeconds.measured)} s  ${e(a.sloshPeriodSeconds.theory, a.sloshPeriodSeconds.measured)}`,
+      `  slosh amplitude  first ${a.sloshDecay.firstQuarter} → last ${a.sloshDecay.lastQuarter} heights`,
+      `  speed at rest    ${a.restSpeed} heights/s (ideal 0)`,
+      `  volume drift     ${a.volumeDriftPercent}% (ideal 0)`, '');
+  }
+  return rows.join('\n');
+}
 function formatBench(r) {
   const g = r.results.grid, f = r.results.flip, row = (label, a, b) => label.padEnd(26) + String(a).padStart(10) + String(b).padStart(10);
   const n = v => v === null ? '>9s' : v;
@@ -1261,23 +1350,25 @@ function formatBench(r) {
 }
 {
   const box = document.createElement('div'); box.className = 'row'; box.style.cssText = 'display:block';
-  box.innerHTML = `<button id="bench">Run benchmark (~30 s)</button> <button id="sweep">Sweep all levels (~40 s)</button> <button id="benchCopy" hidden>Copy results</button>
+  box.innerHTML = `<button id="bench">Run benchmark (~30 s)</button> <button id="sweep">Sweep all levels (~40 s)</button> <button id="theory">Compare with theory (~20 s)</button> <button id="benchCopy" hidden>Copy results</button>
     <pre id="benchOut" style="white-space:pre-wrap;font:11px/1.35 ui-monospace,monospace;color:#fffc;margin:10px 0 0"></pre>
     <small style="color:#fff8">Runs a scripted splash on both algorithms at the current resolution level with a fixed time step. Keep the tab in front and leave the phone alone.</small>`;
   const reset = panel.lastChild; panel.insertBefore(box, reset);
-  const out = box.querySelector('#benchOut'), run = box.querySelector('#bench'), sweep = box.querySelector('#sweep'), copy = box.querySelector('#benchCopy');
+  const out = box.querySelector('#benchOut'), run = box.querySelector('#bench'), sweep = box.querySelector('#sweep'), theory = box.querySelector('#theory'), copy = box.querySelector('#benchCopy');
   let lastJSON = null;
   const go = (btn, job, fmt) => async () => {
-    run.disabled = sweep.disabled = true; copy.hidden = true;
+    run.disabled = sweep.disabled = theory.disabled = true; copy.hidden = true;
     try { const r = await job(m => { out.textContent = m; }); out.textContent = fmt(r); lastJSON = r; copy.hidden = false; console.log('benchmark', JSON.stringify(r)); }
     catch (e) { out.textContent = 'Benchmark failed: ' + e.message; }
-    run.disabled = sweep.disabled = false;
+    run.disabled = sweep.disabled = theory.disabled = false;
   };
   run.onclick = go(run, runBenchmark, formatBench);
   sweep.onclick = go(sweep, runSweep, formatSweep);
+  theory.onclick = go(theory, runTheory, formatTheory);
   copy.onclick = () => { try { navigator.clipboard.writeText(JSON.stringify(lastJSON, null, 2)); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy results', 1500); } catch (_) {} };
 }
 // ?bench in the URL runs it automatically and leaves the numbers in window.benchResult (handy for CI / comparing devices)
+if (/[?&]theory\b/.test(location.search)) setTimeout(() => runTheory(m => { document.title = m; }).then(r => { document.title = 'theory done'; console.log('theory', JSON.stringify(r)); }), 500);
 if (/[?&]sweep\b/.test(location.search)) setTimeout(() => runSweep(m => { document.title = m; }).then(r => { document.title = 'sweep done'; console.log('sweep', JSON.stringify(r)); }), 500);
 if (/[?&]bench\b/.test(location.search)) setTimeout(() => runBenchmark(m => { document.title = m; }).then(r => { document.title = 'bench done'; console.log('benchmark', JSON.stringify(r)); }), 500);
 
