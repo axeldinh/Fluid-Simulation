@@ -26,6 +26,8 @@
   <button id="reset">Reset</button>
   <button id="scene">Scene: Tank</button>
   <button id="tool">Drag: Orbit</button>
+  <button id="paddle">Wave maker: off</button>
+  <button id="tap">Tap: off</button>
   <button id="quality">Quality: Medium</button>
   <button id="motion" hidden>Tilt: off</button>
   <a href="index.html">2D</a>
@@ -71,6 +73,45 @@ bool inGrid(ivec3 p){ return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(
 vec4 at(sampler2D t, ivec3 p){ return inGrid(p) ? texelFetch(t, atl(p), 0) : vec4(0.0); }
 bool isCell(ivec3 p){ return all(greaterThanEqual(p, ivec3(0))) && all(lessThan(p, N - 1)); }
 `;
+// Obstacles: up to 8 exact shapes (signed distance functions) in tank coordinates (x, z in -0.5..0.5, y in 0..1).
+// type: 0 sphere (a.xyz centre, a.w radius)  1 box (a.xyz centre, b.xyz half size)  2 slope (a.xyz normal, a.w offset)
+//       3 sand bed (a.x height, a.y bumps)  4 pipe (a.xyz = centre x, bottom y, centre z; b = inner r, outer r, top y)
+//       5 open glass (a.xyz bottom centre, b.xyz half size, b.w wall)
+// material: 1 concrete, 2 sand, 3 rock, 4 glass, 5 metal
+const OBS = `
+uniform int nObs; uniform int oT[8]; uniform vec4 oA[8], oB[8]; uniform float oM[8];
+uniform float paddleX;            // wave maker plate position (tank x, < -0.5 when off)
+float sdBox(vec3 p, vec3 c, vec3 h){ vec3 q = abs(p - c) - h; return length(max(q, 0.0)) + min(max(q.x, max(q.y, q.z)), 0.0); }
+float sdOne(int i, vec3 p){
+  int t = oT[i]; vec4 a = oA[i], b = oB[i];
+  if (t == 0) return length(p - a.xyz) - a.w;
+  if (t == 1) return sdBox(p, a.xyz, b.xyz);
+  if (t == 2) return dot(p, a.xyz) - a.w;
+  if (t == 3) return (p.y - a.x - a.y * (sin(p.x * 23.0) * 0.6 + sin(p.z * 19.0 + 1.3) * 0.4 + sin((p.x + p.z) * 41.0) * 0.25)) * 0.7;
+  if (t == 4) { float d = abs(length(p.xz - a.xz) - 0.5 * (b.x + b.y)) - 0.5 * (b.y - b.x);
+                float dy = abs(p.y - 0.5 * (a.y + b.z)) - 0.5 * (b.z - a.y);
+                return length(max(vec2(d, dy), 0.0)) + min(max(d, dy), 0.0); }
+  if (t == 5) {                    // open glass = base + four walls (a union keeps distances exact above the opening)
+    float w = 0.5 * b.w, d = sdBox(p, a.xyz + vec3(0.0, w, 0.0), vec3(b.x, w, b.z));
+    d = min(d, sdBox(p, a.xyz + vec3(b.x - w, b.y, 0.0), vec3(w, b.y, b.z)));
+    d = min(d, sdBox(p, a.xyz + vec3(-b.x + w, b.y, 0.0), vec3(w, b.y, b.z)));
+    d = min(d, sdBox(p, a.xyz + vec3(0.0, b.y, b.z - w), vec3(b.x, b.y, w)));
+    return min(d, sdBox(p, a.xyz + vec3(0.0, b.y, -b.z + w), vec3(b.x, b.y, w)));
+  }
+  return 1e3;
+}
+float sdObs(vec3 p, out float mat){
+  float d = 1e3; mat = 0.0;
+  for (int i = 0; i < 8; i++) { if (i >= nObs) break; float e = sdOne(i, p); if (e < d) { d = e; mat = oM[i]; } }
+  if (paddleX > -0.5) { float e = p.x - paddleX; if (e < d) { d = e; mat = 6.0; } }
+  return d;
+}
+float sdObs(vec3 p){ float m; return sdObs(p, m); }
+vec3 obsNormal(vec3 p){
+  vec2 e = vec2(0.002, 0.0);
+  return normalize(vec3(sdObs(p + e.xyy) - sdObs(p - e.xyy), sdObs(p + e.yxy) - sdObs(p - e.yxy), sdObs(p + e.yyx) - sdObs(p - e.yyx)));
+}
+`;
 const SAMPLE = `
 // trilinear sample of one staggered velocity component (0 = u on x-faces, 1 = v, 2 = w) at x (grid units)
 float comp3(sampler2D t, vec3 x, int c){
@@ -112,33 +153,51 @@ void main(){
 }`;
 const MARK_FS = HEAD + `out vec4 o; void main(){ o = vec4(1.0, 0.0, 0.0, 0.0); }`;
 const GRID = {
-  // sums -> velocities, walls closed
-  normalize: HEAD + ATLAS + `uniform sampler2D uA0, uA1, uA2; in vec2 vUv; out vec4 o;
+  // which cells are inside an obstacle (rebuilt every step, so the wave maker can move)
+  solid: HEAD + ATLAS + OBS + `in vec2 vUv; out vec4 o;
     void main(){
-      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a); int G = N.x - 1;
+      ivec3 p = cellOf(ivec2(gl_FragCoord.xy));
+      if (!isCell(p)) { o = vec4(0.0); return; }
+      vec3 w = (vec3(p) + 0.5) / float(N.x - 1) - vec3(0.5, 0.0, 0.5);
+      o = vec4(sdObs(w) < 0.35 / float(N.x - 1) ? 1.0 : 0.0, 0.0, 0.0, 0.0);   // a third of a cell thicker: thin walls stay watertight
+    }`,
+  // sums -> velocities; faces on walls / obstacles take the obstacle's velocity
+  normalize: HEAD + ATLAS + `uniform sampler2D uA0, uA1, uA2, uSolid; uniform float paddleXg, paddleU; in vec2 vUv; out vec4 o;
+    bool solid(ivec3 c){ return !isCell(c) || at(uSolid, c).x > 0.5; }
+    void main(){
+      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a);
       if (!inGrid(p)) { o = vec4(0.0); return; }
       vec2 s0 = texelFetch(uA0, a, 0).xy, s1 = texelFetch(uA1, a, 0).xy, s2 = texelFetch(uA2, a, 0).xy;
       vec3 v = vec3(s0.y > 0.0 ? s0.x / s0.y : 0.0, s1.y > 0.0 ? s1.x / s1.y : 0.0, s2.y > 0.0 ? s2.x / s2.y : 0.0);
-      if (p.x == 0 || p.x == G) v.x = 0.0; if (p.y == 0 || p.y == G) v.y = 0.0; if (p.z == 0 || p.z == G) v.z = 0.0;
+      if (solid(p - ivec3(1, 0, 0)) || solid(p)) v.x = float(p.x) < paddleXg + 0.5 ? paddleU : 0.0;
+      if (solid(p - ivec3(0, 1, 0)) || solid(p)) v.y = 0.0;
+      if (solid(p - ivec3(0, 0, 1)) || solid(p)) v.z = 0.0;
       o = vec4(v, 0.0);
     }`,
-  // gravity on faces next to water, the stirring finger, walls
-  forces: HEAD + ATLAS + `uniform sampler2D uVel, uMark; uniform vec3 g, stirPos, stirVel; uniform float dt, stirR; in vec2 vUv; out vec4 o;
+  // gravity on faces next to water, the stirring finger, a pump jet, obstacles
+  forces: HEAD + ATLAS + `uniform sampler2D uVel, uMark, uSolid; uniform vec3 g, stirPos, stirVel; uniform float dt, stirR, paddleXg, paddleU;
+    uniform vec4 jet; uniform vec2 jetY; uniform float jetV; in vec2 vUv; out vec4 o;
     bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5; }
+    bool solid(ivec3 c){ return !isCell(c) || at(uSolid, c).x > 0.5; }
     void main(){
-      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a); int G = N.x - 1;
+      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a);
       if (!inGrid(p)) { o = vec4(0.0); return; }
-      vec3 v = texelFetch(uVel, a, 0).xyz;
+      vec3 v = texelFetch(uVel, a, 0).xyz, fp = vec3(p);
       if (fluid(p - ivec3(1, 0, 0)) || fluid(p)) v.x += g.x * dt;
       if (fluid(p - ivec3(0, 1, 0)) || fluid(p)) v.y += g.y * dt;
       if (fluid(p - ivec3(0, 0, 1)) || fluid(p)) v.z += g.z * dt;
       if (stirR > 0.0) {
-        vec3 fp = vec3(p);
         v.x += stirVel.x * exp(-dot(fp + vec3(0.0, 0.5, 0.5) - stirPos, fp + vec3(0.0, 0.5, 0.5) - stirPos) / (stirR * stirR));
         v.y += stirVel.y * exp(-dot(fp + vec3(0.5, 0.0, 0.5) - stirPos, fp + vec3(0.5, 0.0, 0.5) - stirPos) / (stirR * stirR));
         v.z += stirVel.z * exp(-dot(fp + vec3(0.5, 0.5, 0.0) - stirPos, fp + vec3(0.5, 0.5, 0.0) - stirPos) / (stirR * stirR));
       }
-      if (p.x == 0 || p.x == G) v.x = 0.0; if (p.y == 0 || p.y == G) v.y = 0.0; if (p.z == 0 || p.z == G) v.z = 0.0;
+      if (jetV != 0.0) {                                  // pump: inside a vertical cylinder the water is driven upward
+        vec3 c = fp + vec3(0.5, 0.0, 0.5);
+        if (length(c.xz - jet.xz) < jet.w && c.y > jetY.x && c.y < jetY.y) { v.y = jetV; v.x = 0.0; v.z = 0.0; }
+      }
+      if (solid(p - ivec3(1, 0, 0)) || solid(p)) v.x = float(p.x) < paddleXg + 0.5 ? paddleU : 0.0;
+      if (solid(p - ivec3(0, 1, 0)) || solid(p)) v.y = 0.0;
+      if (solid(p - ivec3(0, 0, 1)) || solid(p)) v.z = 0.0;
       o = vec4(v, 0.0);
     }`,
   divergence: HEAD + ATLAS + `uniform sampler2D uVel, uMark; in vec2 vUv; out vec4 o;
@@ -148,9 +207,9 @@ const GRID = {
       vec3 c = at(uVel, p).xyz;
       o = vec4(at(uVel, p + ivec3(1, 0, 0)).x - c.x + at(uVel, p + ivec3(0, 1, 0)).y - c.y + at(uVel, p + ivec3(0, 0, 1)).z - c.z, 0.0, 0.0, 0.0);
     }`,
-  // Jacobi: water cells; air neighbours p = 0 (free surface); walls contribute nothing (no flow through them)
-  jacobi: HEAD + ATLAS + `uniform sampler2D uP, uDiv, uMark; in vec2 vUv; out vec4 o;
-    bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5; }
+  // Jacobi: water cells; air neighbours p = 0 (free surface); walls and obstacles contribute nothing
+  jacobi: HEAD + ATLAS + `uniform sampler2D uP, uDiv, uMark, uSolid; in vec2 vUv; out vec4 o;
+    bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5 && at(uSolid, c).x < 0.5; }
     void main(){
       ivec3 p = cellOf(ivec2(gl_FragCoord.xy));
       if (!fluid(p)) { o = vec4(0.0); return; }
@@ -158,28 +217,28 @@ const GRID = {
       ivec3 d[6] = ivec3[6](ivec3(1, 0, 0), ivec3(-1, 0, 0), ivec3(0, 1, 0), ivec3(0, -1, 0), ivec3(0, 0, 1), ivec3(0, 0, -1));
       for (int k = 0; k < 6; k++) {
         ivec3 q = p + d[k];
-        if (!isCell(q)) continue;
+        if (!isCell(q) || at(uSolid, q).x > 0.5) continue;
         n += 1.0;
         if (fluid(q)) s += at(uP, q).x;
       }
       o = vec4((s - at(uDiv, p).x) / max(n, 1.0), 0.0, 0.0, 0.0);
     }`,
   scale: HEAD + `uniform sampler2D uTex; uniform float k; in vec2 vUv; out vec4 o; void main(){ o = texelFetch(uTex, ivec2(gl_FragCoord.xy), 0) * k; }`,
-  gradient: HEAD + ATLAS + `uniform sampler2D uVel, uP, uMark; in vec2 vUv; out vec4 o;
+  gradient: HEAD + ATLAS + `uniform sampler2D uVel, uP, uMark, uSolid; uniform float paddleXg, paddleU; in vec2 vUv; out vec4 o;
     bool fluid(ivec3 c){ return isCell(c) && at(uMark, c).x > 0.5; }
+    bool solid(ivec3 c){ return !isCell(c) || at(uSolid, c).x > 0.5; }
     void main(){
-      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a); int G = N.x - 1;
+      ivec2 a = ivec2(gl_FragCoord.xy); ivec3 p = cellOf(a);
       if (!inGrid(p)) { o = vec4(0.0); return; }
       vec3 v = texelFetch(uVel, a, 0).xyz; float pc = at(uP, p).x;
       ivec3 ex = p - ivec3(1, 0, 0), ey = p - ivec3(0, 1, 0), ez = p - ivec3(0, 0, 1);
-      if (p.x > 0 && p.x < G && (fluid(ex) || fluid(p))) v.x -= pc - at(uP, ex).x;
-      if (p.y > 0 && p.y < G && (fluid(ey) || fluid(p))) v.y -= pc - at(uP, ey).x;
-      if (p.z > 0 && p.z < G && (fluid(ez) || fluid(p))) v.z -= pc - at(uP, ez).x;
-      if (p.x == 0 || p.x == G) v.x = 0.0; if (p.y == 0 || p.y == G) v.y = 0.0; if (p.z == 0 || p.z == G) v.z = 0.0;
+      if (solid(ex) || solid(p)) v.x = float(p.x) < paddleXg + 0.5 ? paddleU : 0.0; else if (fluid(ex) || fluid(p)) v.x -= pc - at(uP, ex).x;
+      if (solid(ey) || solid(p)) v.y = 0.0; else if (fluid(ey) || fluid(p)) v.y -= pc - at(uP, ey).x;
+      if (solid(ez) || solid(p)) v.z = 0.0; else if (fluid(ez) || fluid(p)) v.z -= pc - at(uP, ez).x;
       o = vec4(v, 0.0);
     }`,
-  // grid -> particles (FLIP/PIC blend) and move them (RK2 through the new grid velocity)
-  g2p: HEAD + ATLAS + SAMPLE + `uniform sampler2D uPos, uVel, uGrid, uGridOld; uniform float dt, flip, np; uniform int PW;
+  // grid -> particles (FLIP/PIC blend), move them (RK2), keep them out of walls and obstacles
+  g2p: HEAD + ATLAS + SAMPLE + OBS + `uniform sampler2D uPos, uVel, uGrid, uGridOld; uniform float dt, flip, np, paddleU; uniform int PW;
     in vec2 vUv; layout(location = 0) out vec4 oPos; layout(location = 1) out vec4 oVel;
     void main(){
       ivec2 pi = ivec2(gl_FragCoord.xy);
@@ -192,9 +251,30 @@ const GRID = {
       float G = float(N.x - 1), r = 0.3;
       vec3 lo = vec3(r), hi = vec3(G - r);
       if (nx.x < lo.x || nx.x > hi.x) v.x = 0.0; if (nx.y < lo.y || nx.y > hi.y) v.y = 0.0; if (nx.z < lo.z || nx.z > hi.z) v.z = 0.0;
+      nx = clamp(nx, lo, hi);
+      vec3 w = nx / G - vec3(0.5, 0.0, 0.5); float rw = (r + 0.35) / G, d = sdObs(w);     // same thickened surface as the grid
+      if (d < rw) {                                      // push out of the obstacle along its normal, drop the inward velocity
+        vec3 n = obsNormal(w); w += n * (rw - d); nx = (w + vec3(0.5, 0.0, 0.5)) * G;
+        float vn = dot(v, n); if (vn < 0.0) v -= vn * n;
+        if (paddleX > -0.5 && w.x < paddleX + rw * 1.5) v.x = max(v.x, paddleU);
+      }
       oPos = vec4(clamp(nx, lo, hi), 1.0); oVel = vec4(v, 0.0);
     }`,
+  // the tap: new particles written straight into free slots of the particle textures
 };
+const SPAWN_VS = HEAD + `uniform int PW, base; uniform float seed, G; uniform vec4 tap; uniform float tapV;
+out vec3 vP; out vec3 vV;
+float h(float n){ return fract(sin(n) * 43758.5453); }
+void main(){
+  int i = base + gl_VertexID;
+  float a = h(float(i) * 1.37 + seed) * 6.2832, r = sqrt(h(float(i) * 2.11 + seed * 1.7)) * tap.w;
+  vec3 w = vec3(tap.x + cos(a) * r, tap.y - h(float(i) * 3.3 + seed) * 0.02, tap.z + sin(a) * r);
+  vP = (w + vec3(0.5, 0.0, 0.5)) * G; vV = vec3(0.0, -tapV, 0.0);
+  gl_PointSize = 1.0;
+  gl_Position = vec4((vec2(i % PW, i / PW) + 0.5) / float(PW) * 2.0 - 1.0, 0.0, 1.0);
+}`;
+const SPAWN_FS = HEAD + `in vec3 vP; in vec3 vV; layout(location = 0) out vec4 oPos; layout(location = 1) out vec4 oVel;
+void main(){ oPos = vec4(vP, 1.0); oVel = vec4(vV, 0.0); }`;
 // ----- rendering ---------------------------------------------------------------------------------
 const SPRITE_VS = HEAD + `
 uniform sampler2D uPos; uniform int PW, G; uniform mat4 uView, uProj; uniform float radius, pxScale;
@@ -235,7 +315,7 @@ void main(){
   }
   o = vec4(s / w);
 }`;
-const COMPOSITE_FS = HEAD + `
+const COMPOSITE_FS = HEAD + OBS + `
 uniform sampler2D uDepth, uThick; uniform vec3 camPos, camF, camR, camU, sunDir; uniform vec2 tanHalf, texel; in vec2 vUv; out vec4 o;
 vec3 sky(vec3 d){
   vec3 c = mix(vec3(0.75, 0.82, 0.9), vec3(0.25, 0.45, 0.75), clamp(d.y * 1.4, 0.0, 1.0));
@@ -247,8 +327,54 @@ bool boxHit(vec3 ro, vec3 rd, out float t0, out float t1){
   vec3 a = (lo - ro) * inv, b = (hi - ro) * inv, mn = min(a, b), mx = max(a, b);
   t0 = max(max(mn.x, mn.y), mn.z); t1 = min(min(mx.x, mx.y), mx.z); return t1 > max(t0, 0.0);
 }
-// everything except the water: tiled tank floor, floor around it, sky
+float hash3(vec3 p){ return fract(sin(dot(p, vec3(127.1, 311.7, 74.7))) * 43758.5453); }
+float noise3(vec3 p){
+  vec3 i = floor(p), f = fract(p); f = f * f * (3.0 - 2.0 * f);
+  return mix(mix(mix(hash3(i), hash3(i + vec3(1, 0, 0)), f.x), mix(hash3(i + vec3(0, 1, 0)), hash3(i + vec3(1, 1, 0)), f.x), f.y),
+             mix(mix(hash3(i + vec3(0, 0, 1)), hash3(i + vec3(1, 0, 1)), f.x), mix(hash3(i + vec3(0, 1, 1)), hash3(i + vec3(1, 1, 1)), f.x), f.y), f.z);
+}
+// ray-march the obstacles inside the tank; returns distance (1e6 if none) and the shaded colour
+float marchObs(vec3 ro, vec3 rd, float tmax, out vec3 col, out vec3 gT, out vec3 gA){
+  float t0, t1; col = vec3(0.0); gT = vec3(1.0); gA = vec3(0.0);
+  if (nObs == 0 && paddleX < -0.5) return 1e6;
+  vec3 lo = vec3(-0.5, 0.0, -0.5), hi = vec3(0.5, 1.0, 0.5), inv = 1.0 / rd;
+  vec3 a = (lo - ro) * inv, b = (hi - ro) * inv, mn = min(a, b), mx = max(a, b);
+  t0 = max(max(max(mn.x, mn.y), mn.z), 0.0); t1 = min(min(mx.x, mx.y), mx.z);
+  if (t1 < t0) return 1e6;
+  float t = t0, mat = 0.0;
+  t1 = min(t1, tmax);
+  for (int i = 0; i < 80; i++) {
+    vec3 p = ro + rd * t; float d = sdObs(p, mat);
+    if (d < 0.0015) {
+      vec3 n = obsNormal(p), base;
+      if (mat > 3.5 && mat < 4.5) {                        // glass: reflect a little, tint a little, carry on through it
+        float F = 0.04 + 0.96 * pow(1.0 - abs(dot(rd, n)), 5.0);
+        gA += gT * (F * sky(reflect(rd, n)) + vec3(1.0) * pow(max(dot(reflect(rd, n), sunDir), 0.0), 80.0) * 0.8);
+        gT *= (1.0 - F) * vec3(0.93, 0.97, 0.98);
+        t += 0.03; if (t > t1) break; continue;
+      }
+      if (mat < 1.5) base = vec3(0.6, 0.6, 0.6) * (0.85 + 0.2 * noise3(p * 60.0));
+      else if (mat < 2.5) base = vec3(0.80, 0.70, 0.50) * (0.8 + 0.3 * noise3(p * 220.0));
+      else if (mat < 3.5) base = mix(vec3(0.30, 0.29, 0.27), vec3(0.55, 0.52, 0.47), noise3(p * 14.0)) * (0.75 + 0.35 * noise3(p * 70.0));
+      else if (mat < 4.5) base = vec3(0.85, 0.92, 0.96);
+      else if (mat < 5.5) base = vec3(0.62, 0.65, 0.70);
+      else base = vec3(0.95, 0.68, 0.18);
+      float dif = max(dot(n, sunDir), 0.0) * 0.75 + 0.35;
+      col = base * dif + vec3(1.0) * pow(max(dot(reflect(rd, n), sunDir), 0.0), mat > 3.5 ? 60.0 : 12.0) * (mat > 3.5 ? 0.6 : 0.08);
+      return t;
+    }
+    t += max(d, 0.002);
+    if (t > t1) break;
+  }
+  return 1e6;
+}
+// everything except the water: obstacles, tiled tank floor, floor around it, sky
+vec3 sceneBase(vec3 ro, vec3 rd);
 vec3 scene(vec3 ro, vec3 rd){
+  vec3 oc, gT, gA; float to = marchObs(ro, rd, 1e6, oc, gT, gA);
+  return (to < 1e5 ? oc : sceneBase(ro, rd)) * gT + gA;
+}
+vec3 sceneBase(vec3 ro, vec3 rd){
   if (rd.y < -1e-4) {
     float t = -ro.y / rd.y; vec3 p = ro + rd * t;
     float sun = max(sunDir.y, 0.0) * 0.8 + 0.25;
@@ -272,8 +398,9 @@ vec3 posAt(vec2 uv){ vec3 rd = rayDir(uv); return camPos + rd * (texture(uDepth,
 void main(){
   vec3 rd = rayDir(vUv);
   vec3 col = scene(camPos, rd);
+  vec3 oc, gT, gA; float tObs = marchObs(camPos, rd, 1e6, oc, gT, gA);
   float d = texture(uDepth, vUv).x;
-  if (d < 1e4) {
+  if (d < 1e4 && d / dot(rd, camF) < tObs) {             // water in front of any obstacle
     vec3 P = posAt(vUv);
     vec3 dx1 = posAt(vUv + vec2(texel.x, 0.0)) - P, dx2 = P - posAt(vUv - vec2(texel.x, 0.0));
     vec3 dy1 = posAt(vUv + vec2(0.0, texel.y)) - P, dy2 = P - posAt(vUv - vec2(0.0, texel.y));
@@ -287,6 +414,9 @@ void main(){
     float F = 0.02 + 0.98 * pow(1.0 - max(dot(-rd, n), 0.0), 5.0);
     vec3 rf = reflect(rd, n);
     col = mix(water, sky(rf), F) + vec3(1.0, 0.95, 0.85) * pow(max(dot(rf, sunDir), 0.0), 300.0) * 2.0;
+  }
+  if (d < 1e4 && d / dot(rd, camF) < tObs) {             // glass between the camera and the water still shows
+    vec3 o2, gT2, gA2; marchObs(camPos, rd, d / dot(rd, camF), o2, gT2, gA2); col = col * gT2 + gA2;
   }
   col = glass(camPos, rd, col);
   o = vec4(pow(col, vec3(1.0 / 1.1)), 1.0);
@@ -309,7 +439,7 @@ function program(vs, fs) {
 }
 const PR = {};
 for (const k in GRID) PR[k] = program(QUAD_VS, GRID[k]);
-PR.p2g = program(P2G_VS, P2G_FS); PR.mark = program(MARK_VS, MARK_FS);
+PR.p2g = program(P2G_VS, P2G_FS); PR.mark = program(MARK_VS, MARK_FS); PR.spawn = program(SPAWN_VS, SPAWN_FS);
 PR.depth = program(SPRITE_VS, DEPTH_FS); PR.thick = program(SPRITE_VS, THICK_FS);
 PR.blur = program(QUAD_VS, BLUR_FS); PR.composite = program(QUAD_VS, COMPOSITE_FS);
 
@@ -350,12 +480,12 @@ function clear(tgt, r = 0) { gl.bindFramebuffer(gl.FRAMEBUFFER, tgt.fb); gl.view
 // ----- simulation state ----------------------------------------------------------------------------
 const SIM = {};
 function buildSim() {
-  for (const k of ['acc0', 'acc1', 'acc2', 'mark', 'vel', 'velOld', 'velTmp', 'div', 'p0', 'p1', 'pos0', 'pos1', 'vel0', 'vel1']) if (SIM[k]) SIM[k].free();
+  for (const k of ['acc0', 'acc1', 'acc2', 'mark', 'solid', 'vel', 'velOld', 'velTmp', 'div', 'p0', 'p1', 'pos0', 'pos1', 'vel0', 'vel1']) if (SIM[k]) SIM[k].free();
   if (SIM.mrt) SIM.mrt.forEach(f => gl.deleteFramebuffer(f));
   const G = QUALITY[cfg.quality].g, N = G + 1, TX = Math.ceil(Math.sqrt(N)), TY = Math.ceil(N / TX);
   Object.assign(SIM, { G, N, TX, AW: TX * N, AH: TY * N });
   const A = (f = gl.RGBA16F) => target(SIM.AW, SIM.AH, f);
-  SIM.acc0 = A(); SIM.acc1 = A(); SIM.acc2 = A(); SIM.mark = A(gl.R16F);
+  SIM.acc0 = A(); SIM.acc1 = A(); SIM.acc2 = A(); SIM.mark = A(gl.R16F); SIM.solid = A(gl.R16F);
   SIM.vel = A(); SIM.velOld = A(); SIM.velTmp = A(); SIM.div = A(gl.R32F); SIM.p0 = A(gl.R32F); SIM.p1 = A(gl.R32F);
   // particles: 8 per cell in the water; texture big enough for a full tank
   SIM.PW = Math.ceil(Math.sqrt(G * G * G * 8 * 0.75));
@@ -369,23 +499,64 @@ function buildSim() {
   });
   SIM.flipFlop = 0; SIM.np = 0;
 }
+// water(x, y, z) in 0..1 tank units; obs: shapes in tank coordinates (see OBS); paddle / tap / jet: features
 const SCENES = {
   tank: { label: 'Tank', water: (x, y, z) => y < 0.45 },
-  dam: { label: 'Dam break', water: (x, y, z) => x < 0.35 && y < 0.8 },
+  dam: { label: 'Dam break', water: (x, y, z) => x < 0.35 && y < 0.8,
+    obs: [{ t: 1, a: [0.22, 0.06, 0.0, 0], b: [0.04, 0.06, 0.12, 0], m: 1 }] },
   drop: { label: 'Drop', water: (x, y, z) => y < 0.2 || ((x - 0.5) ** 2 + (y - 0.72) ** 2 + (z - 0.5) ** 2 < 0.18 * 0.18) },
+  wavepool: { label: 'Wave pool', paddle: true, water: (x, y, z) => y < 0.32,
+    obs: [{ t: 2, a: [-0.625, 0.781, 0.0, 0.0], m: 2 }] },        // sand beach: solid below y = 0.8 x (rises towards +x)
+  aquarium: { label: 'Aquarium', water: (x, y, z) => y < 0.8,
+    obs: [{ t: 3, a: [0.06, 0.012, 0, 0], m: 2 }, { t: 0, a: [-0.22, 0.05, -0.12, 0.11], m: 3 }, { t: 0, a: [0.16, 0.06, 0.15, 0.09], m: 3 },
+          { t: 0, a: [0.25, 0.04, -0.2, 0.06], m: 3 }, { t: 1, a: [0.0, 0.12, 0.05, 0], b: [0.03, 0.12, 0.05, 0], m: 3 }] },
+  fountain: { label: 'Fountain', water: (x, y, z) => y < 0.36, jet: true,
+    obs: [{ t: 4, a: [0.0, 0.12, 0.0, 0], b: [0.08, 0.11, 0.5, 0], m: 5 }] },   // raised: water flows in underneath
+  glass: { label: 'Glass being filled', tap: true, water: () => false,
+    obs: [{ t: 5, a: [0.0, 0.0, 0.0, 0], b: [0.17, 0.17, 0.17, 0.02], m: 4 }] },
   corner: { label: 'Corner column', water: (x, y, z) => x < 0.35 && z < 0.35 && y < 0.9 },
 };
 const sceneKeys = Object.keys(SCENES);
 let scene = 'tank';
+// the same shapes on the CPU, for seeding particles outside obstacles
+function obsSDF(p) {
+  let d = 1e3;
+  for (const o of SCENES[scene].obs || []) {
+    const a = o.a, b = o.b || [0, 0, 0, 0];
+    let e = 1e3;
+    if (o.t === 0) e = Math.hypot(p[0] - a[0], p[1] - a[1], p[2] - a[2]) - a[3];
+    else if (o.t === 1) { const q = [0, 1, 2].map(i => Math.abs(p[i] - a[i]) - b[i]); e = Math.hypot(...q.map(v => Math.max(v, 0))) + Math.min(Math.max(...q), 0); }
+    else if (o.t === 2) e = p[0] * a[0] + p[1] * a[1] + p[2] * a[2] - a[3];
+    else if (o.t === 3) e = p[1] - a[0] - a[1];
+    else if (o.t === 4) { const dr = Math.abs(Math.hypot(p[0] - a[0], p[2] - a[2]) - 0.5 * (b[0] + b[1])) - 0.5 * (b[1] - b[0]); e = (p[1] > a[1] && p[1] < b[2]) ? dr : 1e3; }
+    else if (o.t === 5) e = (Math.abs(p[0] - a[0]) < b[0] && Math.abs(p[2] - a[2]) < b[2] && p[1] < a[1] + 2 * b[1])
+      ? Math.min(b[0] - Math.abs(p[0] - a[0]), b[2] - Math.abs(p[2] - a[2]), p[1] - a[1]) - b[3] : 1e3;   // inside the glass: distance to its walls
+    d = Math.min(d, e);
+  }
+  return d;
+}
+const FEAT = { paddle: false, t: 0, tap: false, jet: false };
+function paddleNow() {                                // piston wave maker on the -x wall: tank x position and speed (tank units)
+  if (!FEAT.paddle) return null;
+  const w = 2 * Math.PI * 0.9, amp = 0.025, t = FEAT.t;
+  return { x: -0.5 + 0.04 + amp * (1 - Math.cos(w * t)), v: amp * w * Math.sin(w * t) };
+}
+function obsUniforms(u) {                             // upload the scene's shapes to any program that includes OBS
+  const list = SCENES[scene].obs || [], T = new Int32Array(8), A = new Float32Array(32), B = new Float32Array(32), M = new Float32Array(8);
+  list.forEach((o, i) => { T[i] = o.t; A.set(o.a, 4 * i); B.set(o.b || [0, 0, 0, 0], 4 * i); M[i] = o.m; });
+  gl.uniform1i(u.nObs, list.length); gl.uniform1iv(u.oT, T); gl.uniform4fv(u.oA, A); gl.uniform4fv(u.oB, B); gl.uniform1fv(u.oM, M);
+  const pd = paddleNow(); gl.uniform1f(u.paddleX, pd ? pd.x : -1);
+}
 function seed() {                                    // 2x2x2 jittered particles per cell wherever the scene has water
   const { G, PW } = SIM, pos = new Float32Array(PW * PW * 4), vel = new Float32Array(PW * PW * 4), S = SCENES[scene];
   let n = 0;
   for (let k = 0; k < G * 2 && n < PW * PW; k++) for (let j = 0; j < G * 2 && n < PW * PW; j++) for (let i = 0; i < G * 2 && n < PW * PW; i++) {
     const x = (i + 0.25 + 0.5 * Math.random()) / 2, y = (j + 0.25 + 0.5 * Math.random()) / 2, z = (k + 0.25 + 0.5 * Math.random()) / 2;
-    if (!S.water(x / G, y / G, z / G)) continue;
+    if (!S.water(x / G, y / G, z / G) || obsSDF([x / G - 0.5, y / G, z / G - 0.5]) < 0.3 / G) continue;
     pos.set([Math.min(Math.max(x, 0.3), G - 0.3), Math.min(Math.max(y, 0.3), G - 0.3), Math.min(Math.max(z, 0.3), G - 0.3), 1], 4 * n); n++;
   }
-  SIM.np = n; SIM.flipFlop = 0;
+  SIM.np = n; SIM.flipFlop = 0; SIM.spawnAcc = 0;
+  FEAT.paddle = !!S.paddle; FEAT.t = 0; FEAT.tap = !!S.tap; FEAT.jet = !!S.jet; syncButtons();
   for (const [t, d] of [[SIM.pos0, pos], [SIM.vel0, vel]]) { gl.bindTexture(gl.TEXTURE_2D, t.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, PW, PW, gl.RGBA, gl.FLOAT, d); }
   clear(SIM.p0); clear(SIM.p1);
 }
@@ -394,9 +565,28 @@ const atlasUniforms = u => { gl.uniform3i(u.N, SIM.N, SIM.N, SIM.N); gl.uniform1
 
 // ----- one simulation step ---------------------------------------------------------------------------
 const stir = { on: false, pos: [0, 0, 0], vel: [0, 0, 0] };
+function spawn(dt) {                                  // tap: a round nozzle at the top centre pouring at 1 tank height / s
+  const { G, PW } = SIM, r = 0.045, v = 1.2, rate = 8 * Math.PI * (r * G) ** 2 * (v * G);   // 8 particles per cell
+  SIM.spawnAcc += rate * dt;
+  const k = Math.min(Math.floor(SIM.spawnAcc), PW * PW - SIM.np);
+  if (k <= 0) { if (SIM.np >= PW * PW) FEAT.tap = false; return; }
+  SIM.spawnAcc -= k;
+  const fb = SIM.mrt[SIM.flipFlop ? 0 : 1];           // write into the textures the next step reads
+  gl.useProgram(PR.spawn.p); const u = PR.spawn.u;
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]); gl.viewport(0, 0, PW, PW);
+  gl.uniform1i(u.PW, PW); gl.uniform1i(u.base, SIM.np); gl.uniform1f(u.seed, Math.random() * 100); gl.uniform1f(u.G, G);
+  gl.uniform4f(u.tap, 0, 0.93, 0, r); gl.uniform1f(u.tapV, v * G);
+  gl.bindVertexArray(emptyVAO); gl.drawArrays(gl.POINTS, 0, k);
+  gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
+  SIM.np += k;
+}
 function step(dt, gWorld) {
   const { G, np, PW } = SIM;
-  if (!np) return;
+  const pd = paddleNow(), pxg = pd ? (pd.x + 0.5) * G : -1, pug = pd ? pd.v * G : 0;
+  draw(PR.solid, SIM.solid, u => { atlasUniforms(u); obsUniforms(u); });
+  if (FEAT.tap) spawn(dt);
+  if (!SIM.np) return;
+  const np2 = SIM.np;
   // 1. particles -> grid
   gl.bindVertexArray(emptyVAO); gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
   for (let c = 0; c < 3; c++) {
@@ -404,35 +594,40 @@ function step(dt, gWorld) {
     gl.useProgram(PR.p2g.p); unit = 0; const u = PR.p2g.u;
     bind(u.uPos, curPos()); bind(u.uVel, curVel()); atlasUniforms(u);
     gl.uniform1i(u.PW, PW); gl.uniform1i(u.comp, c); gl.uniform2f(u.atlasSize, SIM.AW, SIM.AH);
-    for (let k = 0; k < 8; k++) { gl.uniform3i(u.corner, k & 1, (k >> 1) & 1, (k >> 2) & 1); gl.drawArrays(gl.POINTS, 0, np); }
+    for (let k = 0; k < 8; k++) { gl.uniform3i(u.corner, k & 1, (k >> 1) & 1, (k >> 2) & 1); gl.drawArrays(gl.POINTS, 0, np2); }
   }
   clear(SIM.mark);
   gl.useProgram(PR.mark.p); unit = 0; bind(PR.mark.u.uPos, curPos()); atlasUniforms(PR.mark.u);
-  gl.uniform1i(PR.mark.u.PW, PW); gl.uniform2f(PR.mark.u.atlasSize, SIM.AW, SIM.AH); gl.drawArrays(gl.POINTS, 0, np);
+  gl.uniform1i(PR.mark.u.PW, PW); gl.uniform2f(PR.mark.u.atlasSize, SIM.AW, SIM.AH); gl.drawArrays(gl.POINTS, 0, np2);
   gl.disable(gl.BLEND);
-  draw(PR.normalize, SIM.velOld, u => { atlasUniforms(u); bind(u.uA0, SIM.acc0); bind(u.uA1, SIM.acc1); bind(u.uA2, SIM.acc2); });
+  draw(PR.normalize, SIM.velOld, u => { atlasUniforms(u); bind(u.uA0, SIM.acc0); bind(u.uA1, SIM.acc1); bind(u.uA2, SIM.acc2); bind(u.uSolid, SIM.solid);
+    gl.uniform1f(u.paddleXg, pxg); gl.uniform1f(u.paddleU, pug); });
   // 2. forces on the grid (FLIP will hand the particles the difference to velOld)
   draw(PR.forces, SIM.vel, u => {
-    atlasUniforms(u); bind(u.uVel, SIM.velOld); bind(u.uMark, SIM.mark);
+    atlasUniforms(u); bind(u.uVel, SIM.velOld); bind(u.uMark, SIM.mark); bind(u.uSolid, SIM.solid);
     gl.uniform3f(u.g, gWorld[0] * G, gWorld[1] * G, gWorld[2] * G); gl.uniform1f(u.dt, dt);
+    gl.uniform1f(u.paddleXg, pxg); gl.uniform1f(u.paddleU, pug);
+    gl.uniform4f(u.jet, 0.5 * G, 0, 0.5 * G, 0.075 * G); gl.uniform2f(u.jetY, 0.15 * G, 0.48 * G); gl.uniform1f(u.jetV, FEAT.jet ? 2.6 * G : 0);
     gl.uniform1f(u.stirR, stir.on ? 0.12 * G : 0); gl.uniform3f(u.stirPos, ...stir.pos.map(v => v * G)); gl.uniform3f(u.stirVel, ...stir.vel.map(v => v * G * 0.25));
   });
   // 3. pressure: warm start from last step, Jacobi
   draw(PR.divergence, SIM.div, u => { atlasUniforms(u); bind(u.uVel, SIM.vel); bind(u.uMark, SIM.mark); });
   let pa = SIM.p0, pb = SIM.p1;
   for (let i = 0; i < cfg.iters; i++) {
-    draw(PR.jacobi, pb, u => { atlasUniforms(u); bind(u.uP, pa); bind(u.uDiv, SIM.div); bind(u.uMark, SIM.mark); });
+    draw(PR.jacobi, pb, u => { atlasUniforms(u); bind(u.uP, pa); bind(u.uDiv, SIM.div); bind(u.uMark, SIM.mark); bind(u.uSolid, SIM.solid); });
     [pa, pb] = [pb, pa];
   }
   if (pa !== SIM.p0) [SIM.p0, SIM.p1] = [SIM.p1, SIM.p0];
-  draw(PR.gradient, SIM.velTmp, u => { atlasUniforms(u); bind(u.uVel, SIM.vel); bind(u.uP, SIM.p0); bind(u.uMark, SIM.mark); });
+  draw(PR.gradient, SIM.velTmp, u => { atlasUniforms(u); bind(u.uVel, SIM.vel); bind(u.uP, SIM.p0); bind(u.uMark, SIM.mark); bind(u.uSolid, SIM.solid);
+    gl.uniform1f(u.paddleXg, pxg); gl.uniform1f(u.paddleU, pug); });
   [SIM.vel, SIM.velTmp] = [SIM.velTmp, SIM.vel];
   // 4. grid -> particles, move them
   const out = SIM.mrt[SIM.flipFlop];
   gl.useProgram(PR.g2p.p); unit = 0; const u = PR.g2p.u;
   gl.bindFramebuffer(gl.FRAMEBUFFER, out); gl.drawBuffers([gl.COLOR_ATTACHMENT0, gl.COLOR_ATTACHMENT1]); gl.viewport(0, 0, PW, PW);
   atlasUniforms(u); bind(u.uPos, curPos()); bind(u.uVel, curVel()); bind(u.uGrid, SIM.vel); bind(u.uGridOld, SIM.velOld);
-  gl.uniform1f(u.dt, dt); gl.uniform1f(u.flip, cfg.flip); gl.uniform1f(u.np, np); gl.uniform1i(u.PW, PW);
+  gl.uniform1f(u.dt, dt); gl.uniform1f(u.flip, cfg.flip); gl.uniform1f(u.np, np2); gl.uniform1i(u.PW, PW);
+  obsUniforms(u); gl.uniform1f(u.paddleU, pug);
   gl.bindVertexArray(quadVAO); gl.drawArrays(gl.TRIANGLE_STRIP, 0, 4);
   gl.drawBuffers([gl.COLOR_ATTACHMENT0]);
   SIM.flipFlop ^= 1;
@@ -486,6 +681,7 @@ function render() {
     gl.uniform3f(u.camPos, ...C.pos); gl.uniform3f(u.camF, ...C.F); gl.uniform3f(u.camR, ...C.R); gl.uniform3f(u.camU, ...C.U);
     gl.uniform2f(u.tanHalf, ...C.tanHalf); gl.uniform2f(u.texel, 1.5 / src.w, 1.5 / src.h);
     gl.uniform3f(u.sunDir, ...v3.norm([0.5, 0.8, 0.3]));
+    obsUniforms(u);
   });
   return C;
 }
@@ -538,7 +734,13 @@ if ('DeviceMotionEvent' in window && matchMedia('(pointer: coarse)').matches) {
   };
 }
 $('reset').onclick = () => seed();
-$('scene').onclick = () => { scene = sceneKeys[(sceneKeys.indexOf(scene) + 1) % sceneKeys.length]; $('scene').textContent = 'Scene: ' + SCENES[scene].label; seed(); };
+function syncButtons() {
+  $('scene').textContent = 'Scene: ' + SCENES[scene].label;
+  $('paddle').textContent = 'Wave maker: ' + (FEAT.paddle ? 'on' : 'off'); $('tap').textContent = 'Tap: ' + (FEAT.tap ? 'on' : 'off');
+}
+$('paddle').onclick = () => { FEAT.paddle = !FEAT.paddle; FEAT.t = 0; syncButtons(); };
+$('tap').onclick = () => { FEAT.tap = !FEAT.tap; syncButtons(); };
+$('scene').onclick = () => { scene = sceneKeys[(sceneKeys.indexOf(scene) + 1) % sceneKeys.length]; seed(); };
 $('tool').onclick = () => { tool = tool === 'orbit' ? 'stir' : 'orbit'; $('tool').textContent = 'Drag: ' + (tool === 'orbit' ? 'Orbit' : 'Stir'); };
 $('quality').onclick = () => { cfg.quality = (cfg.quality + 1) % QUALITY.length; $('quality').textContent = 'Quality: ' + QUALITY[cfg.quality].name; buildSim(); seed(); };
 
@@ -555,10 +757,12 @@ const grav = [0, -1, 0];
 let last = performance.now(), frames = 0, acc = 0;
 function frame(now) {
   const raw = (now - last) / 1000; last = now;
+  if (window.sim3d && sim3d.pause) { requestAnimationFrame(frame); return; }
   const dt = Math.min(Math.max(raw, 0.001), 1 / 30);
   const tg = tilt.on ? tilt.g : [0, -1, 0], f = Math.min(1, dt * 8);
   for (let i = 0; i < 3; i++) grav[i] += (tg[i] - grav[i]) * f;
   const g = grav.map(x => x * cfg.gravity);
+  if (FEAT.paddle) FEAT.t += dt;
   for (let s = 0; s < cfg.substeps; s++) step(dt / cfg.substeps, g);
   lastCam = render();
   frames++; acc += raw;
@@ -566,7 +770,20 @@ function frame(now) {
   requestAnimationFrame(frame);
 }
 requestAnimationFrame(frame);
-window.sim3d = { SIM, step, render, seed, cfg, cam, setScene: s => { scene = s; seed(); } };
+// read particles back (for tests / benchmarks): rms speed (heights/s), water level stats (heights)
+function measure() {
+  const { PW, np, G } = SIM, pos = new Float32Array(PW * PW * 4), vel = new Float32Array(PW * PW * 4);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, curPos().fb); gl.readPixels(0, 0, PW, PW, gl.RGBA, gl.FLOAT, pos);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, curVel().fb); gl.readPixels(0, 0, PW, PW, gl.RGBA, gl.FLOAT, vel);
+  let k = 0, bad = 0; const ys = [];
+  for (let i = 0; i < np; i++) {
+    const v = vel.subarray(4 * i, 4 * i + 3); k += v[0] * v[0] + v[1] * v[1] + v[2] * v[2];
+    if (!isFinite(pos[4 * i])) bad++; ys.push(pos[4 * i + 1] / G);
+  }
+  ys.sort((a, b) => a - b);
+  return { rms: Math.sqrt(k / np) / G, p50: ys[np >> 1], p99: ys[Math.floor(np * 0.99)], bad, np };
+}
+window.sim3d = { SIM, step, render, seed, cfg, cam, measure, setScene: s => { scene = s; seed(); }, setQuality: q => { cfg.quality = q; buildSim(); seed(); }, pause: false };
 </script>
 </body>
 </html>
