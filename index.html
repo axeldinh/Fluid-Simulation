@@ -563,8 +563,9 @@ class Flip {
     this.nx = nx; this.ny = ny; this.fX = nx + 2; this.fY = ny + 2;     // +1 solid wall cell all around
     const N = this.N = this.fX * this.fY, fX = this.fX, fY = this.fY;
     for (const k of ['u', 'v', 'du', 'dv', 'pu', 'pv', 's', 'dens', 'P']) this[k] = new Float32Array(N);
-    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.sleep = 15; this.k = 1; this.push = 1; this.pushOnce = true; this.maxSub = 3;
-    // sleep: speeds below this (cells/s) are damped so resting water goes completely still; k: strength of the volume-drift correction
+    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.sleep = 0.05 * ny; this.k = 1; this.push = 1; this.pushOnce = true; this.maxSub = 3;
+    // sleep: speeds below this (cells/s; 0.05 screen heights/s) are damped so resting water goes completely still
+    // without also killing gentle waves; k: strength of the volume-drift correction
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
     this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
@@ -1284,6 +1285,10 @@ function periodFromSeries(eta, dt) {               // mean spacing of zero cross
   return 2 * (cr[cr.length - 1] - cr[0]) / (cr.length - 1) * dt;
 }
 async function theoryAlgo(algo, progress) {
+  const dampSaved = cfg.velocityDissipation; cfg.velocityDissipation = 0;   // compare the numerics, not the damping setting
+  try { return await theoryAlgoRun(algo, progress); } finally { cfg.velocityDissipation = dampSaved; }
+}
+async function theoryAlgoRun(algo, progress) {
   setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
   const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, aspect = canvas.width / canvas.height;
   progress(`${algo}: settling…`);
