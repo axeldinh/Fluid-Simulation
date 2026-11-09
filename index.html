@@ -563,7 +563,7 @@ class Flip {
     this.nx = nx; this.ny = ny; this.fX = nx + 2; this.fY = ny + 2;     // +1 solid wall cell all around
     const N = this.N = this.fX * this.fY, fX = this.fX, fY = this.fY;
     for (const k of ['u', 'v', 'du', 'dv', 'pu', 'pv', 's', 'dens', 'P']) this[k] = new Float32Array(N);
-    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.sleep = 15; this.k = 1; this.push = 2;
+    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.sleep = 15; this.k = 1; this.push = 1; this.pushOnce = true; this.maxSub = 3;
     // sleep: speeds below this (cells/s) are damped so resting water goes completely still; k: strength of the volume-drift correction
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
@@ -718,18 +718,21 @@ class Flip {
     }
   }
   substep(dt, gx, gy, ratio, iters) {
-    const { np, pos, vel } = this, minX = 1 + this.r, maxX = this.fX - 1 - this.r, minY = 1 + this.r, maxY = this.fY - 1 - this.r;
+    const { np, pos, vel } = this;
     this.transfer(true, 0);
     this.pu.set(this.u); this.pv.set(this.v);          // snapshot before forces: FLIP copies (after - before) back to the particles
     this.addGravity(dt, gx, gy);
     this.updateDensity(); this.solve(iters, dt); this.transfer(false, ratio);
     for (let i = 0; i < np; i++) {
       // let nearly-still water go fully still (kills the low-level FLIP jitter) without touching real motion
-      let sp = Math.hypot(vel[2 * i], vel[2 * i + 1]), f = 1;
+      const vx = vel[2 * i], vy = vel[2 * i + 1]; let sp = Math.sqrt(vx * vx + vy * vy), f = 1;
       if (sp < this.sleep) { const t = Math.max(0, (sp - this.sleep * 0.2) / (this.sleep * 0.8)); f = 0.3 + 0.7 * t * t * (3 - 2 * t); vel[2 * i] *= f; vel[2 * i + 1] *= f; }
       pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
     }
-    this.pushApart(this.push);
+    if (!this.pushOnce) { this.pushApart(this.push); this.walls(); }
+  }
+  walls() {
+    const { np, pos, vel } = this, minX = 1 + this.r, maxX = this.fX - 1 - this.r, minY = 1 + this.r, maxY = this.fY - 1 - this.r;
     for (let i = 0; i < np; i++) {
       let x = pos[2 * i], y = pos[2 * i + 1];
       if (x < minX) { x = minX; vel[2 * i] = 0; } if (x > maxX) { x = maxX; vel[2 * i] = 0; }
@@ -739,8 +742,9 @@ class Flip {
   }
   step(dt, gx, gy, ratio, iters) {
     let vmax = 0; for (let i = 0; i < this.np; i++) { const a = this.vel[2 * i], b = this.vel[2 * i + 1]; vmax = Math.max(vmax, a * a + b * b); }
-    const sub = Math.min(3, Math.max(1, Math.ceil(Math.sqrt(vmax) * dt / 1.0)));   // keep particles under ~1 cell per substep
+    const sub = Math.min(this.maxSub, Math.max(1, Math.ceil(Math.sqrt(vmax) * dt / 1.0)));   // keep particles under ~1 cell per substep
     for (let k = 0; k < sub; k++) this.substep(dt / sub, gx, gy, ratio, iters);
+    if (this.pushOnce) { this.pushApart(this.push); this.walls(); }       // positional spreading once per frame instead of per substep
   }
   // finger drag: add velocity to particles near (x, y) given in cell coordinates
   stir(cx, cy, rad2, vx, vy) {
