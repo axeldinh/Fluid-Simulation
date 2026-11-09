@@ -78,6 +78,7 @@ const LEVELS = [
 ];
 // A tank of water: an advected 0..1 fill fraction on a staggered grid with a two-phase pressure solve ("grid"),
 // or FLIP particles. Gravity pulls it down; you can slosh, stir it and grow new blobs of water.
+const ALGOS = ['grid', 'flip', 'apic'], ALGO_NAMES = { grid: 'Grid', flip: 'FLIP', apic: 'APIC Pro' };
 const cfg = {
   level: 2,
   auto: true,
@@ -88,13 +89,15 @@ const cfg = {
   gravity: 30,        // water mode: screen heights per second² (≈ Earth gravity for a 30 cm tank)
   ballGrowth: 0.25,   // water mode: how fast a held-down water ball grows (screen heights per second)
   sharpen: 1.0,       // grid water: interface contrast boost per frame (only applied where water moves fast). Anything above 1.0 made the resting pool slowly start to boil in tests, so it stays off
-  waterAlgo: 'grid',  // 'grid' = Eulerian two-phase solver on the GPU, 'flip' = FLIP particles (CPU)
+  waterAlgo: 'grid',  // 'grid' = Eulerian two-phase solver on the GPU, 'flip' = FLIP particles (CPU), 'apic' = APIC + PCG + ghost-fluid particles (CPU)
   flipRatio: 0.9,     // FLIP: 0 = pure PIC (smooth, damped), 1 = pure FLIP (lively, noisier)
-  flipIters: 40,      // FLIP: pressure solver sweeps per step
+  flipIters: 40,      // FLIP: pressure solver sweeps per step (APIC Pro: maximum conjugate-gradient iterations)
   density: 100,       // water mode: water density relative to air (real water ≈ 800; 100 stays calmer)
   tiltStrength: 1,    // multiplier for device-tilt gravity
   maxDpr: 1.5,
 };
+
+const isParticles = () => cfg.waterAlgo !== 'grid';
 
 // ----- shaders -------------------------------------------------------------
 const VERT = `#version 300 es
@@ -494,7 +497,7 @@ function initBuffers() {
   if (!massTex) massTex = makeFBO(128, 128, gl.LINEAR, true);
   if (fresh) fillWater();
   buildWater(sw, sh);
-  if (cfg.waterAlgo === 'flip') buildFlip();
+  if (isParticles()) buildFlip();
 }
 // ----- water solver ----------------------------------------------------------
 // Staggered (MAC) grid, two phases. Pressure is solved from  div(beta grad p) = div u  with
@@ -770,6 +773,187 @@ class Flip {
   }
 }
 
+// ----- APIC Pro: the methods used in production solvers, on top of the FLIP machinery ----------------
+//  * APIC transfers (Jiang et al. 2015): every particle carries an affine velocity field (a 2x2 matrix) instead
+//    of a single velocity, so rotation and shear survive particle<->grid transfers. No FLIP/PIC blending
+//    knob, no FLIP noise and much less numerical damping.
+//  * Pressure by preconditioned conjugate gradients with a modified incomplete Cholesky (MIC(0)) preconditioner
+//    (Bridson, "Fluid Simulation for Computer Graphics") instead of a few Gauss-Seidel sweeps: the system is
+//    actually solved to a tolerance, so resting water has the right hydrostatic pressure.
+//  * Ghost-fluid free surface: the pressure is zero *at the sub-cell position of the surface*, taken from a
+//    smooth level set built from the particle density, not at the centre of whatever cell contains a particle.
+class Apic extends Flip {
+  constructor(nx, ny) {
+    super(nx, ny);
+    this.C = new Float32Array(4 * this.maxP);                   // per particle: [du/dx du/dy dv/dx dv/dy]
+    for (const k of ['phi', 'rhs', 'res', 'zv', 'sv', 'qv', 'pre', 'Ad', 'Ax', 'Ay', 'pv_', 'As']) this[k] = new Float64Array(this.N);
+    this.restConst = 1 / ((2 * this.r) * (Math.sqrt(3) / 2 * 2 * this.r));      // particles per cell of the starting hex packing (~3.2)
+    this.rest = this.restConst; this.sleep = 0.02 * ny; this.tol = 1e-4; this.lastIters = 0;
+    this.damp = 2;                                              // viscous-style velocity damping per second (APIC alone would slosh almost forever)
+  }
+  add(x, y, vx = 0, vy = 0) {
+    const i = this.np, ok = super.add(x, y, vx, vy);
+    if (ok) { const c = this.C; c[4 * i] = c[4 * i + 1] = c[4 * i + 2] = c[4 * i + 3] = 0; }
+    return ok;
+  }
+  fill(level) { super.fill(level); this.rest = this.restConst; }
+  stamp(cx, cy, rad) { super.stamp(cx, cy, rad); this.C.fill(0); this.rest = this.restConst; }
+  updateDensity() { this.rest = this.restConst; super.updateDensity(); }
+
+  // APIC particle -> grid and grid -> particle
+  transfer(toGrid) {
+    const { fX, fY, np, pos, vel, type, s, C, dens, phi } = this, n = fY, rest = this.rest;
+    if (toGrid) {
+      this.du.fill(0); this.dv.fill(0); this.u.fill(0); this.v.fill(0);
+      for (let i = 0; i < this.N; i++) {
+        if (s[i] === 0) { type[i] = F_SOLID; phi[i] = 1; continue; }
+        const f = Math.min(dens[i] / rest, 1.5);
+        type[i] = f > 0.5 ? F_FLUID : F_AIR; phi[i] = (0.5 - f) * 2;           // signed distance-like level set, in cells
+      }
+    }
+    for (let comp = 0; comp < 2; comp++) {
+      const dx = comp === 0 ? 0 : 0.5, dy = comp === 0 ? 0.5 : 0;
+      const f = comp === 0 ? this.u : this.v, d = comp === 0 ? this.du : this.dv, off = comp === 0 ? n : 1;
+      for (let i = 0; i < np; i++) {
+        const x = Math.min(Math.max(pos[2 * i], 1), fX - 1), y = Math.min(Math.max(pos[2 * i + 1], 1), fY - 1);
+        const x0 = Math.min(Math.floor(x - dx), fX - 2), tx = (x - dx) - x0, x1 = Math.min(x0 + 1, fX - 2);
+        const y0 = Math.min(Math.floor(y - dy), fY - 2), ty = (y - dy) - y0, y1 = Math.min(y0 + 1, fY - 2);
+        const sx = 1 - tx, sy = 1 - ty, d0 = sx * sy, d1 = tx * sy, d2 = tx * ty, d3 = sx * ty;
+        const n0 = x0 * n + y0, n1 = x1 * n + y0, n2 = x1 * n + y1, n3 = x0 * n + y1;
+        if (toGrid) {
+          const pv = vel[2 * i + comp], cx = C[4 * i + 2 * comp], cy = C[4 * i + 2 * comp + 1];
+          // value at each node = particle velocity + affine term evaluated at the node's position
+          f[n0] += d0 * (pv + cx * (x0 + dx - x) + cy * (y0 + dy - y)); d[n0] += d0;
+          f[n1] += d1 * (pv + cx * (x1 + dx - x) + cy * (y0 + dy - y)); d[n1] += d1;
+          f[n2] += d2 * (pv + cx * (x1 + dx - x) + cy * (y1 + dy - y)); d[n2] += d2;
+          f[n3] += d3 * (pv + cx * (x0 + dx - x) + cy * (y1 + dy - y)); d[n3] += d3;
+        } else {
+          const v0 = (type[n0] !== F_AIR || type[n0 - off] !== F_AIR) ? 1 : 0, v1 = (type[n1] !== F_AIR || type[n1 - off] !== F_AIR) ? 1 : 0;
+          const v2 = (type[n2] !== F_AIR || type[n2 - off] !== F_AIR) ? 1 : 0, v3 = (type[n3] !== F_AIR || type[n3 - off] !== F_AIR) ? 1 : 0;
+          const dd = v0 * d0 + v1 * d1 + v2 * d2 + v3 * d3;
+          if (dd > 0) {
+            vel[2 * i + comp] = (v0 * d0 * f[n0] + v1 * d1 * f[n1] + v2 * d2 * f[n2] + v3 * d3 * f[n3]) / dd;
+            if (v0 + v1 + v2 + v3 === 4) {       // full stencil: the gradient of the interpolant is the new affine matrix row
+              C[4 * i + 2 * comp] = (f[n1] - f[n0]) * sy + (f[n2] - f[n3]) * ty;
+              C[4 * i + 2 * comp + 1] = (f[n3] - f[n0]) * sx + (f[n2] - f[n1]) * tx;
+            } else { C[4 * i + 2 * comp] = 0; C[4 * i + 2 * comp + 1] = 0; }
+          } else { vel[2 * i + comp] += (comp ? this._gy : this._gx) * this._dt; C[4 * i + 2 * comp] = 0; C[4 * i + 2 * comp + 1] = 0; }   // lone droplet: free fall
+        }
+      }
+      if (toGrid) {
+        for (let i = 0; i < f.length; i++) if (d[i] > 0) f[i] /= d[i];
+        for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {          // no flow through walls
+          const c = i * n + j, solid = type[c] === F_SOLID;
+          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = 0;
+          if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = 0;
+        }
+      }
+    }
+  }
+
+  // matrix-free A*p for the (symmetric) pressure system on fluid cells
+  _mul(x, out) {
+    const { fX, fY, type, Ad, Ax, Ay } = this, n = fY;
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j; if (type[c] !== F_FLUID) { out[c] = 0; continue; }
+      out[c] = Ad[c] * x[c] + Ax[c] * x[c + n] + Ax[c - n] * x[c - n] + Ay[c] * x[c + 1] + Ay[c - 1] * x[c - 1];
+    }
+  }
+  _precond(r, z) {                                  // z = M^-1 r with the MIC(0) factor in this.pre
+    const { fX, fY, type, Ax, Ay, pre, qv } = this, n = fY;
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j; if (type[c] !== F_FLUID) continue;
+      qv[c] = (r[c] - Ax[c - n] * pre[c - n] * qv[c - n] - Ay[c - 1] * pre[c - 1] * qv[c - 1]) * pre[c];
+    }
+    for (let i = fX - 2; i >= 1; i--) for (let j = fY - 2; j >= 1; j--) {
+      const c = i * n + j; if (type[c] !== F_FLUID) { z[c] = 0; continue; }
+      z[c] = (qv[c] - Ax[c] * pre[c] * z[c + n] - Ay[c] * pre[c] * z[c + 1]) * pre[c];
+    }
+  }
+  solve(iters, dt) {
+    const { fX, fY, u, v, type, phi, dens, P, Ad, Ax, Ay, rhs, pre, res, zv, sv, As } = this, n = fY, rest = this.rest, p = this.pv_;
+    // 1. assemble: sum_n coef (p_c - p_n) = -div   (air neighbours: p = 0 at the ghost-fluid distance, coef = 1/theta)
+    Ad.fill(0); Ax.fill(0); Ay.fill(0); p.fill(0);
+    const ws = this.lastDt > 0 ? dt / this.lastDt : 0; this.lastDt = dt;
+    let bmax = 0;
+    const ghost = (c, nb) => { const th = phi[c] / (phi[c] - phi[nb]); return 1 / Math.min(1, Math.max(0.2, th)); };
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j;
+      if (type[c] !== F_FLUID) { P[c] = 0; continue; }
+      let diag = 0;
+      for (const nb of [c - n, c + n, c - 1, c + 1]) {
+        if (type[nb] === F_SOLID) continue;
+        if (type[nb] === F_FLUID) { diag += 1; if (nb === c + n) Ax[c] = -1; else if (nb === c + 1) Ay[c] = -1; }
+        else diag += ghost(c, nb);
+      }
+      Ad[c] = diag;
+      let div = u[c + n] - u[c] + v[c + 1] - v[c];
+      const comp = dens[c] - rest; if (comp > 0) div -= this.k * comp;           // gentle push-apart of over-packed particles
+      rhs[c] = -div; bmax = Math.max(bmax, Math.abs(div));
+      p[c] = P[c] * ws;                                                          // warm start from last step's pressure
+    }
+    // 2. MIC(0) preconditioner
+    const tau = 0.97, sigma = 0.25;
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j; if (type[c] !== F_FLUID) { pre[c] = 0; continue; }
+      let e = Ad[c];
+      const L = c - n, D = c - 1;
+      if (type[L] === F_FLUID) { const a = Ax[L] * pre[L]; e -= a * a + tau * Ax[L] * Ay[L] * pre[L] * pre[L]; }
+      if (type[D] === F_FLUID) { const a = Ay[D] * pre[D]; e -= a * a + tau * Ay[D] * Ax[D] * pre[D] * pre[D]; }
+      if (e < sigma * Ad[c]) e = Ad[c];
+      pre[c] = 1 / Math.sqrt(e);
+    }
+    // 3. preconditioned conjugate gradients
+    this._mul(p, As);
+    let rmax = 0;
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) { const c = i * n + j; if (type[c] === F_FLUID) { res[c] = rhs[c] - As[c]; rmax = Math.max(rmax, Math.abs(res[c])); } }
+    const target = this.tol * Math.max(bmax, 1e-6);
+    let it = 0;
+    if (rmax > target) {
+      this._precond(res, zv);
+      let sigmaDot = 0;
+      for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) { const c = i * n + j; if (type[c] === F_FLUID) { sv[c] = zv[c]; sigmaDot += res[c] * zv[c]; } }
+      for (; it < iters; it++) {
+        this._mul(sv, As);
+        let sAs = 0; for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) { const c = i * n + j; if (type[c] === F_FLUID) sAs += sv[c] * As[c]; }
+        if (sAs <= 0) break;
+        const alpha = sigmaDot / sAs; rmax = 0;
+        for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+          const c = i * n + j; if (type[c] !== F_FLUID) continue;
+          p[c] += alpha * sv[c]; res[c] -= alpha * As[c]; rmax = Math.max(rmax, Math.abs(res[c]));
+        }
+        if (rmax < target) { it++; break; }
+        this._precond(res, zv);
+        let sigmaNew = 0; for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) { const c = i * n + j; if (type[c] === F_FLUID) sigmaNew += res[c] * zv[c]; }
+        const beta = sigmaNew / sigmaDot; sigmaDot = sigmaNew;
+        for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) { const c = i * n + j; if (type[c] === F_FLUID) sv[c] = zv[c] + beta * sv[c]; }
+      }
+    }
+    this.lastIters = it;
+    // 4. subtract the pressure gradient from the face velocities (air side: p = 0, ghost-fluid weight)
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j; if (type[c] !== F_FLUID) continue;
+      P[c] = p[c];
+      const R = c + n, L = c - n, T = c + 1, D = c - 1;
+      if (type[R] === F_FLUID) u[R] -= p[R] - p[c]; else if (type[R] === F_AIR) u[R] -= ghost(c, R) * (0 - p[c]);
+      if (type[L] === F_AIR) u[c] -= ghost(c, L) * (p[c] - 0);
+      if (type[T] === F_FLUID) v[T] -= p[T] - p[c]; else if (type[T] === F_AIR) v[T] -= ghost(c, T) * (0 - p[c]);
+      if (type[D] === F_AIR) v[c] -= ghost(c, D) * (p[c] - 0);
+    }
+  }
+  substep(dt, gx, gy) {
+    const { np, pos, vel } = this; this._gx = gx; this._gy = gy; this._dt = dt;
+    this.updateDensity(); this.transfer(true); this.addGravity(dt, gx, gy); this.solve(this._iters, dt); this.transfer(false);
+    for (let i = 0; i < np; i++) {
+      const dk = 1 / (1 + this.damp * dt); vel[2 * i] *= dk; vel[2 * i + 1] *= dk;
+      const vx = vel[2 * i], vy = vel[2 * i + 1]; const sp = Math.sqrt(vx * vx + vy * vy);
+      if (sp < this.sleep) { const t = Math.max(0, (sp - this.sleep * 0.2) / (this.sleep * 0.8)), f = 0.3 + 0.7 * t * t * (3 - 2 * t); vel[2 * i] *= f; vel[2 * i + 1] *= f; }
+      pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
+    }
+  }
+  step(dt, gx, gy, ratio, iters) { this._iters = iters; super.step(dt, gx, gy, ratio, iters); }
+}
+
 const FL = { sim: null, dens: null, texU: null, texV: null, vao: null, vbo: null, uv: null, ubuf: null, vbuf: null };
 function floatTex(w, h) {
   const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
@@ -780,8 +964,9 @@ function floatTex(w, h) {
 }
 function buildFlip() {
   const short = [24, 32, 48, 64, 96][cfg.level], [nx, ny] = gridSize(short), old = FL.sim;
-  if (!old || old.nx !== nx || old.ny !== ny) {
-    const f = new Flip(nx, ny);
+  const wantApic = cfg.waterAlgo === 'apic';
+  if (!old || old.nx !== nx || old.ny !== ny || (old instanceof Apic) !== wantApic) {
+    const f = wantApic ? new Apic(nx, ny) : new Flip(nx, ny);
     if (!old) f.fill(FILL_LEVEL);
     else {                          // keep the water: re-map particles (thinning / duplicating them to suit the new resolution)
       const k = (nx * ny) / (old.nx * old.ny);
@@ -808,6 +993,7 @@ function fillFlip() { FL.sim.fill(FILL_LEVEL); }
 
 function stepFlip(dt) {
   const f = FL.sim, nx = f.nx, ny = f.ny, gm = cfg.gravity * ny * (tilt.on ? cfg.tiltStrength : 1);
+  f.damp = cfg.velocityDissipation;
   f.step(dt, grav.x * gm, grav.y * gm, cfg.flipRatio, cfg.flipIters);
 
   // grid velocities -> small textures (only used for foam in the renderer)
@@ -882,7 +1068,7 @@ function stepWater(dt) {
 }
 
 function render() {
-  const flip = cfg.waterAlgo === 'flip', [W, H] = flip ? [FL.sim.nx, FL.sim.ny] : WS.grid;
+  const flip = isParticles(), [W, H] = flip ? [FL.sim.nx, FL.sim.ny] : WS.grid;
   texUnit = 0; const w = use(P.displayWater, water.read.texel);
   bindTex(w.uWater, water.read); bindTex(w.uU, flip ? FL.texU : WS.U.read); bindTex(w.uV, flip ? FL.texV : WS.V.read);
   const bd = new Float32Array(12); let bi = 0;
@@ -895,7 +1081,7 @@ function render() {
 
 // Drop a solid ball of water into the simulation, replacing whatever was there (and its motion).
 function stampBall(x, y, r) {
-  if (cfg.waterAlgo === 'flip') { const f = FL.sim; f.stamp(1 + x * f.nx, 1 + y * f.ny, r * f.ny); return; }
+  if (isParticles()) { const f = FL.sim; f.stamp(1 + x * f.nx, 1 + y * f.ny, r * f.ny); return; }
   const aspect = canvas.width / canvas.height, [W, H] = WS.grid;
   texUnit = 0; let u = use(P.stampPhi); bindTex(u.uTex, water.read);
   gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect); gl.uniform1f(u.radius, r);
@@ -920,7 +1106,7 @@ function stampBall(x, y, r) {
 function splatRadius() { const aspect = canvas.width / canvas.height; return (cfg.splatRadius / 100) * (aspect > 1 ? aspect : 1); }
 function splat(x, y, dx, dy) {
   const radius = splatRadius();
-  if (cfg.waterAlgo === 'flip') {
+  if (isParticles()) {
     const f = FL.sim, k = f.ny / WS.grid[1];       // push velocities are given in (grid-solver cells)/s; convert to FLIP cells
     f.stir(1 + x * f.nx, 1 + y * f.ny, radius * f.ny * f.ny, dx * k, dy * k);
     return;
@@ -1010,17 +1196,17 @@ $('clear').onclick = () => { clearFB(water.read); clearFB(water.write); clearWat
 window.addEventListener('resize', () => { if (resizeCanvas()) initBuffers(); });
 
 // ----- settings panel --------------------------------------------------------
-const GRID = ['grid'], FLIPA = ['flip'];
+const GRID = ['grid'], FLIPA = ['flip'], PARTS = ['flip', 'apic'];
 const SCHEMA = [
   { k: 'gravity', label: 'Gravity', min: 0, max: 40, step: 0.5, hint: 'Screen heights per second². Earth-like for a ~30 cm tank is about 30.' },
   { k: 'flipRatio', label: 'FLIP blend (0 = smooth PIC, 1 = splashy FLIP)', min: 0, max: 1, step: 0.01, algos: FLIPA },
-  { k: 'flipIters', label: 'Pressure iterations (CPU cost)', min: 10, max: 120, step: 5, algos: FLIPA,
-    hint: 'More = water behaves more incompressibly, but costs more CPU.' },
+  { k: 'flipIters', label: 'Pressure iterations (CPU cost)', min: 10, max: 120, step: 5, algos: PARTS,
+    hint: 'FLIP: Gauss-Seidel sweeps. APIC Pro: maximum conjugate-gradient iterations (it stops early once converged). More = more incompressible, more CPU.' },
   { k: 'density', label: 'Water density vs air', min: 2, max: 1000, step: 1, log: true, algos: GRID,
     hint: 'Real water is ≈ 800× denser than air. Lower = lighter water, faster but floatier splashes.' },
   { k: 'ballGrowth', label: 'Water ball growth speed', min: 0.05, max: 1, step: 0.05 },
   { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1 },
-  { k: 'velocityDissipation', label: 'Velocity damping', min: 0, max: 4, step: 0.05, algos: GRID },
+  { k: 'velocityDissipation', label: 'Velocity damping (viscosity-like)', min: 0, max: 4, step: 0.05, algos: ['grid', 'apic'] },
   { k: 'pressure', label: 'Pressure persistence', min: 0, max: 1, step: 0.01, algos: GRID },
   { k: 'splatRadius', label: 'Brush size', min: 0.05, max: 1, step: 0.01 },
   { k: 'splatForce', label: 'Stir force', min: 500, max: 20000, step: 100 },
@@ -1037,9 +1223,10 @@ const rows = [];
 {
   const r = addRow(`<label>Water algorithm</label><span></span><select style="grid-column:1/-1;font:inherit;padding:8px;border-radius:8px;background:#ffffff1f;color:#fff;border:1px solid #ffffff2e">
     <option value="grid" style="color:#000">Grid — two-phase solver (GPU)</option>
-    <option value="flip" style="color:#000">FLIP — particles + grid (CPU)</option></select>
+    <option value="flip" style="color:#000">FLIP — particles + grid (CPU)</option>
+    <option value="apic" style="color:#000">APIC Pro — affine particles, PCG, ghost-fluid surface (CPU)</option></select>
     <small style="grid-column:1/-1;color:#fff8">They are different methods with different looks and costs. Switching refills the tank.</small>`);
-  r.dataset.algos = 'grid flip'; rows.push(r);
+  r.dataset.algos = ALGOS.join(' '); rows.push(r);
   const sel = r.querySelector('select'); sel.value = cfg.waterAlgo;
   sel.onchange = () => { setAlgo(sel.value); save(); };
   widgets.waterAlgo = () => { sel.value = cfg.waterAlgo; };
@@ -1048,7 +1235,7 @@ for (const s of SCHEMA) {
   const lo = s.log ? 0 : s.min, hi = s.log ? 1 : s.max, st = s.log ? 0.001 : s.step;
   const row = addRow(`<label>${s.label}</label><output></output><input type="range" min="${lo}" max="${hi}" step="${st}">`
     + (s.hint ? `<small style="grid-column:1/-1;color:#fff8;margin-top:-2px">${s.hint}</small>` : ''));
-  row.dataset.algos = (s.algos || ['grid', 'flip']).join(' '); rows.push(row);
+  row.dataset.algos = (s.algos || ALGOS).join(' '); rows.push(row);
   const inp = row.querySelector('input'), out = row.querySelector('output');
   const fmt = v => s.log ? (v >= 100 ? Math.round(v) : +v.toPrecision(2)) + '×' : +(+v).toFixed(2);
   const toVal = t => s.log ? Math.round(s.min * Math.pow(s.max / s.min, t) * 10) / 10 : t;
@@ -1069,7 +1256,7 @@ for (const s of SCHEMA) {
 }
 function setAlgo(a) {
   cfg.waterAlgo = a;
-  if (a === 'flip') { if (!FL.sim) buildFlip(); fillFlip(); }
+  if (a !== 'grid') { if (FL.sim && (FL.sim instanceof Apic) !== (a === 'apic')) FL.sim = null; buildFlip(); fillFlip(); }
   else { clearFB(water.read); clearFB(water.write); clearWaterFlow(); fillWater(); }
   if (widgets.waterAlgo) widgets.waterAlgo();
   applyModeVisibility();
@@ -1100,7 +1287,7 @@ function applyModeVisibility() {      // only show the settings that matter for 
   panel.appendChild(b);
 }
 applyModeVisibility();
-if (cfg.waterAlgo === 'flip' && !FL.sim) buildFlip();
+if (isParticles() && !FL.sim) buildFlip();
 $('gear').onclick = () => { document.body.classList.toggle('panel', panel.classList.toggle('open')); };
 
 // ----- adaptive quality ----------------------------------------------------
@@ -1143,7 +1330,7 @@ function syncGPU(fb) {
 }
 function benchSpeed(algo) {                       // RMS water speed, in screen heights per second
   try {
-    if (algo === 'flip') {
+    if (algo !== 'grid') {
       const f = FL.sim; let k = 0; for (let i = 0; i < f.np; i++) k += f.vel[2 * i] ** 2 + f.vel[2 * i + 1] ** 2;
       return Math.sqrt(k / Math.max(1, f.np)) / f.ny;
     }
@@ -1154,13 +1341,13 @@ function benchSpeed(algo) {                       // RMS water speed, in screen 
 }
 function benchVolume(algo) {                      // water volume as a fraction of the tank
   try {
-    if (algo === 'flip') return FL.sim.np / (FL.sim.nx * FL.sim.ny * 3.2);
+    if (algo !== 'grid') return FL.sim.np / (FL.sim.nx * FL.sim.ny * 3.2);
     const a = readRGBA(massTex); let k = 0; for (let i = 0; i < a.length; i += 4) k += a[i]; return k / (massTex.w * massTex.h);
   } catch (_) { return NaN; }
 }
 async function benchAlgo(algo, progress) {
   setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
-  const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, stepMs = [], drawMs = [];
+  const dt = 1 / 60, run = algo !== 'grid' ? stepFlip : stepWater, stepMs = [], drawMs = [];
   const one = (record) => {
     const t0 = performance.now(); run(dt); syncGPU(water); const t1 = performance.now(); render(); syncGPU(null); const t2 = performance.now();
     if (record) { stepMs.push(t1 - t0); drawMs.push(t2 - t1); }
@@ -1182,8 +1369,8 @@ async function benchAlgo(algo, progress) {
   const vol1 = benchVolume(algo), frame = stepMs.map((v, i) => v + drawMs[i]);
   return {
     algorithm: algo,
-    particles: algo === 'flip' ? FL.sim.np : null,
-    grid: algo === 'flip' ? [FL.sim.nx, FL.sim.ny] : WS.grid.slice(),
+    particles: algo !== 'grid' ? FL.sim.np : null,
+    grid: algo !== 'grid' ? [FL.sim.nx, FL.sim.ny] : WS.grid.slice(),
     msPerFrame: { avg: +avg(frame).toFixed(2), p95: +pct(frame, 0.95).toFixed(2), worst: +Math.max(...frame).toFixed(2) },
     stepMsAvg: +avg(stepMs).toFixed(2), drawMsAvg: +avg(drawMs).toFixed(2),
     maxFps: Math.round(1000 / avg(frame)),
@@ -1203,7 +1390,7 @@ async function runBenchmark(progress = () => {}) {
     canvas: [canvas.width, canvas.height], level: cfg.level, settings: { gravity: cfg.gravity, density: cfg.density, flipRatio: cfg.flipRatio, flipIters: cfg.flipIters },
     results: {},
   };
-  try { for (const algo of ['grid', 'flip']) out.results[algo] = await benchAlgo(algo, progress); }
+  try { for (const algo of ALGOS) out.results[algo] = await benchAlgo(algo, progress); }
   finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
   bench.result = out; window.benchResult = out;
   return out;
@@ -1220,29 +1407,31 @@ async function runSweep(progress = () => {}) {
     for (let l = 0; l < LEVELS.length; l++) {
       cfg.level = l; initBuffers();
       const row = { level: l, sim: LEVELS[l].sim, surface: LEVELS[l].tex };
-      for (const algo of ['grid', 'flip']) {
+      for (const algo of ALGOS) {
         progress(`level ${l + 1}/${LEVELS.length}: ${algo}…`); await yieldUI();
         setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
-        const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, step = [], draw = [];
+        const dt = 1 / 60, run = algo !== 'grid' ? stepFlip : stepWater, step = [], draw = [];
         const one = rec => { const t0 = performance.now(); run(dt); syncGPU(water); const t1 = performance.now(); render(); syncGPU(null); const t2 = performance.now(); if (rec) { step.push(t1 - t0); draw.push(t2 - t1); } };
         for (let i = 0; i < 20; i++) one(false);
         stampBall(0.5, 0.75, 0.12);
         for (let i = 0; i < 60; i++) { one(true); if (i % 10 === 9) await yieldUI(); }
         const tot = step.map((v, i) => v + draw[i]);
-        row[algo] = { ms: +avg(tot).toFixed(1), p95: +pct(tot, 0.95).toFixed(1), step: +avg(step).toFixed(1), draw: +avg(draw).toFixed(1), fps: Math.round(1000 / avg(tot)), particles: algo === 'flip' ? FL.sim.np : null };
+        row[algo] = { ms: +avg(tot).toFixed(1), p95: +pct(tot, 0.95).toFixed(1), step: +avg(step).toFixed(1), draw: +avg(draw).toFixed(1), fps: Math.round(1000 / avg(tot)), particles: algo !== 'grid' ? FL.sim.np : null };
       }
       out.levels.push(row);
     }
   } finally { cfg.level = saved.level; initBuffers(); setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
   const best = a => { const ok = out.levels.filter(r => r[a].p95 <= 16.7); return ok.length ? ok[ok.length - 1].level : null; };
-  out.recommended = { grid: best('grid'), flip: best('flip') };       // highest level whose 95th-percentile frame still fits 60 fps
+  out.recommended = Object.fromEntries(ALGOS.map(a => [a, best(a)]));       // highest level whose 95th-percentile frame still fits 60 fps
   window.sweepResult = out; return out;
 }
 function formatSweep(r) {
-  const rows = r.levels.map(x => `L${x.level} ${String(x.sim).padStart(3)}/${String(x.surface).padStart(4)}  ${String(x.grid.ms).padStart(6)} ${String(x.grid.fps).padStart(4)}   ${String(x.flip.ms).padStart(6)} ${String(x.flip.fps).padStart(4)} ${String(x.flip.particles).padStart(6)}`);
-  const rec = v => v === null ? 'none reaches 60 fps' : 'level ' + v;
-  return [`GPU: ${r.gpu}`, `canvas ${r.canvas.join('x')}, ${r.cores ?? '?'} cores`, '', 'level sim/surf   grid ms  fps    flip ms  fps  parts', ...rows, '',
-    `60 fps (p95): Grid ${rec(r.recommended.grid)}, FLIP ${rec(r.recommended.flip)}`].join('\n');
+  const cell = (x, w) => String(x).padStart(w);
+  const rows = r.levels.map(x => `L${x.level} ${cell(x.sim, 3)}/${cell(x.surface, 4)}  ` + ALGOS.map(a => `${cell(x[a].ms, 6)}${cell(x[a].fps, 4)}`).join('  ') + `  ${cell(x.flip.particles, 6)}p`);
+  const rec = v => v === null ? 'none' : 'level ' + v;
+  return [`GPU: ${r.gpu}`, `canvas ${r.canvas.join('x')}, ${r.cores ?? '?'} cores`, '',
+    'level sim/surf  ' + ALGOS.map(a => ALGO_NAMES[a].slice(0, 8).padStart(10)).join('  ') + '   (ms, fps)', ...rows, '',
+    '60 fps (p95): ' + ALGOS.map(a => `${ALGO_NAMES[a]} ${rec(r.recommended[a])}`).join(', ')].join('\n');
 }
 // ---- accuracy: compare with analytic physics ------------------------------------------
 // Three textbook results the simulation can be held against (all lengths in screen heights):
@@ -1261,7 +1450,7 @@ function benchColumns() {                          // water depth (in screen hei
   return { left: l / (3 * n), right: r / (3 * n), mean: m / (n * n) };
 }
 function floorPressure(algo, dt) {                 // pressure at the bottom minus pressure at the top, in the solver's units
-  if (algo === 'flip') {
+  if (algo !== 'grid') {
     const f = FL.sim; let s = 0, c = 0;
     for (let i = 3; i < f.fX - 3; i++) { s += f.P[i * f.fY + 1]; c++; }
     return { value: s / c, dt: f.lastDt, g: cfg.gravity * f.ny, cells: f.ny };
@@ -1290,7 +1479,7 @@ async function theoryAlgo(algo, progress) {
 }
 async function theoryAlgoRun(algo, progress) {
   setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
-  const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, aspect = canvas.width / canvas.height;
+  const dt = 1 / 60, run = algo !== 'grid' ? stepFlip : stepWater, aspect = canvas.width / canvas.height;
   progress(`${algo}: settling…`);
   for (let i = 0; i < 150; i++) { run(dt); if (i % 10 === 9) await yieldUI(); }
   const rest = benchColumns(), speedRest = benchSpeed(algo), h = rest.mean;
@@ -1325,7 +1514,7 @@ async function runTheory(progress = () => {}) {
   const saved = { algo: cfg.waterAlgo, auto: cfg.auto };
   bench.on = true; cfg.auto = false;
   const out = { when: new Date().toISOString(), level: cfg.level, settings: { gravity: cfg.gravity, density: cfg.density, flipRatio: cfg.flipRatio, flipIters: cfg.flipIters }, results: {} };
-  try { for (const algo of ['grid', 'flip']) out.results[algo] = await theoryAlgo(algo, progress); }
+  try { for (const algo of ALGOS) out.results[algo] = await theoryAlgo(algo, progress); }
   finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
   window.theoryResult = out; return out;
 }
@@ -1333,9 +1522,9 @@ function formatTheory(r) {
   const e = (th, m) => (th && m !== null && isFinite(m)) ? ((100 * (m - th) / th) >= 0 ? '+' : '') + (100 * (m - th) / th).toFixed(1) + '%' : 'n/a';
   const f = x => x === null || x === undefined ? 'n/a' : x;
   const rows = [];
-  for (const algo of ['grid', 'flip']) {
+  for (const algo of ALGOS) {
     const a = r.results[algo];
-    rows.push(`${algo.toUpperCase()}  (tank ${a.tankWidthInHeights} heights wide)`,
+    rows.push(`${ALGO_NAMES[algo].toUpperCase()}  (tank ${a.tankWidthInHeights} heights wide)`,
       `  water level      expected ${a.level.expected}  measured ${a.level.measured}  ${e(a.level.expected, a.level.measured)}`,
       `  bottom pressure  expected ${a.bottomPressure.expected}  measured ${a.bottomPressure.measured}  ${e(a.bottomPressure.expected, a.bottomPressure.measured)}`,
       `  sloshing period  theory ${a.sloshPeriodSeconds.theory} s  measured ${f(a.sloshPeriodSeconds.measured)} s  ${e(a.sloshPeriodSeconds.theory, a.sloshPeriodSeconds.measured)}`,
@@ -1346,20 +1535,15 @@ function formatTheory(r) {
   return rows.join('\n');
 }
 function formatBench(r) {
-  const g = r.results.grid, f = r.results.flip, row = (label, a, b) => label.padEnd(26) + String(a).padStart(10) + String(b).padStart(10);
+  const R = r.results, row = (label, get) => label.padEnd(24) + ALGOS.map(a => String(get(R[a])).padStart(11)).join('');
   const n = v => v === null ? '>9s' : v;
   return [`GPU: ${r.gpu}`, `Level ${r.level}, canvas ${r.canvas.join('x')}, ${r.cores ?? '?'} cores`, '',
-    row('', 'Grid', 'FLIP'),
-    row('max fps (GPU-synced)', g.maxFps, f.maxFps),
-    row('ms/frame avg', g.msPerFrame.avg, f.msPerFrame.avg),
-    row('  simulation', g.stepMsAvg, f.stepMsAvg),
-    row('  drawing', g.drawMsAvg, f.drawMsAvg),
-    row('ms/frame p95', g.msPerFrame.p95, f.msPerFrame.p95),
-    row('ms/frame worst', g.msPerFrame.worst, f.msPerFrame.worst),
-    row('particles', g.particles ?? '-', f.particles),
-    row('settle time (s)', n(g.settleSeconds), n(f.settleSeconds)),
-    row('speed at end (h/s)', g.speedAtEnd, f.speedAtEnd),
-    row('volume drift %', g.volumeDriftPercent, f.volumeDriftPercent)].join('\n');
+    row('', () => '').replace(/\s+$/, '') + '', ''.padEnd(24) + ALGOS.map(a => ALGO_NAMES[a].padStart(11)).join(''),
+    row('max fps (GPU-synced)', x => x.maxFps),
+    row('ms/frame avg', x => x.msPerFrame.avg), row('  simulation', x => x.stepMsAvg), row('  drawing', x => x.drawMsAvg),
+    row('ms/frame p95', x => x.msPerFrame.p95), row('ms/frame worst', x => x.msPerFrame.worst),
+    row('particles', x => x.particles ?? '-'),
+    row('settle time (s)', x => n(x.settleSeconds)), row('speed at end (h/s)', x => x.speedAtEnd), row('volume drift %', x => x.volumeDriftPercent)].join('\n');
 }
 {
   const box = document.createElement('div'); box.className = 'row'; box.style.cssText = 'display:block';
@@ -1392,7 +1576,7 @@ function frame(now) {
   const dt = Math.min(Math.max(raw, 0.001), 1 / 30);
   if (bench.on) { requestAnimationFrame(frame); return; }          // the benchmark drives the simulation itself
   updateGravity(dt); applyPointers(dt);
-  if (cfg.waterAlgo === 'flip') stepFlip(dt); else stepWater(dt);
+  if (isParticles()) stepFlip(dt); else stepWater(dt);
   render();
   if (raw < 0.5) adapt(raw);              // ignore tab-switch hiccups
   requestAnimationFrame(frame);
