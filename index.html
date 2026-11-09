@@ -1207,6 +1207,42 @@ async function runBenchmark(progress = () => {}) {
   bench.result = out; window.benchResult = out;
   return out;
 }
+// Frame cost of both algorithms at every resolution level (splash scene, no settling analysis): shows
+// which level each algorithm can afford on this device.
+async function runSweep(progress = () => {}) {
+  const saved = { algo: cfg.waterAlgo, auto: cfg.auto, level: cfg.level };
+  bench.on = true; cfg.auto = false;
+  const ext = gl.getExtension('WEBGL_debug_renderer_info');
+  const out = { when: new Date().toISOString(), gpu: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'unknown', cores: navigator.hardwareConcurrency || null,
+    canvas: [canvas.width, canvas.height], settings: { gravity: cfg.gravity, density: cfg.density, flipRatio: cfg.flipRatio, flipIters: cfg.flipIters }, levels: [] };
+  try {
+    for (let l = 0; l < LEVELS.length; l++) {
+      cfg.level = l; initBuffers();
+      const row = { level: l, sim: LEVELS[l].sim, surface: LEVELS[l].tex };
+      for (const algo of ['grid', 'flip']) {
+        progress(`level ${l + 1}/${LEVELS.length}: ${algo}…`); await yieldUI();
+        setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
+        const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, step = [], draw = [];
+        const one = rec => { const t0 = performance.now(); run(dt); syncGPU(water); const t1 = performance.now(); render(); syncGPU(null); const t2 = performance.now(); if (rec) { step.push(t1 - t0); draw.push(t2 - t1); } };
+        for (let i = 0; i < 20; i++) one(false);
+        stampBall(0.5, 0.75, 0.12);
+        for (let i = 0; i < 60; i++) { one(true); if (i % 10 === 9) await yieldUI(); }
+        const tot = step.map((v, i) => v + draw[i]);
+        row[algo] = { ms: +avg(tot).toFixed(1), p95: +pct(tot, 0.95).toFixed(1), step: +avg(step).toFixed(1), draw: +avg(draw).toFixed(1), fps: Math.round(1000 / avg(tot)), particles: algo === 'flip' ? FL.sim.np : null };
+      }
+      out.levels.push(row);
+    }
+  } finally { cfg.level = saved.level; initBuffers(); setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
+  const best = a => { const ok = out.levels.filter(r => r[a].p95 <= 16.7); return ok.length ? ok[ok.length - 1].level : null; };
+  out.recommended = { grid: best('grid'), flip: best('flip') };       // highest level whose 95th-percentile frame still fits 60 fps
+  window.sweepResult = out; return out;
+}
+function formatSweep(r) {
+  const rows = r.levels.map(x => `L${x.level} ${String(x.sim).padStart(3)}/${String(x.surface).padStart(4)}  ${String(x.grid.ms).padStart(6)} ${String(x.grid.fps).padStart(4)}   ${String(x.flip.ms).padStart(6)} ${String(x.flip.fps).padStart(4)} ${String(x.flip.particles).padStart(6)}`);
+  const rec = v => v === null ? 'none reaches 60 fps' : 'level ' + v;
+  return [`GPU: ${r.gpu}`, `canvas ${r.canvas.join('x')}, ${r.cores ?? '?'} cores`, '', 'level sim/surf   grid ms  fps    flip ms  fps  parts', ...rows, '',
+    `60 fps (p95): Grid ${rec(r.recommended.grid)}, FLIP ${rec(r.recommended.flip)}`].join('\n');
+}
 function formatBench(r) {
   const g = r.results.grid, f = r.results.flip, row = (label, a, b) => label.padEnd(26) + String(a).padStart(10) + String(b).padStart(10);
   const n = v => v === null ? '>9s' : v;
@@ -1225,20 +1261,24 @@ function formatBench(r) {
 }
 {
   const box = document.createElement('div'); box.className = 'row'; box.style.cssText = 'display:block';
-  box.innerHTML = `<button id="bench">Run benchmark (~30 s)</button> <button id="benchCopy" hidden>Copy results</button>
+  box.innerHTML = `<button id="bench">Run benchmark (~30 s)</button> <button id="sweep">Sweep all levels (~40 s)</button> <button id="benchCopy" hidden>Copy results</button>
     <pre id="benchOut" style="white-space:pre-wrap;font:11px/1.35 ui-monospace,monospace;color:#fffc;margin:10px 0 0"></pre>
     <small style="color:#fff8">Runs a scripted splash on both algorithms at the current resolution level with a fixed time step. Keep the tab in front and leave the phone alone.</small>`;
   const reset = panel.lastChild; panel.insertBefore(box, reset);
-  const out = box.querySelector('#benchOut'), run = box.querySelector('#bench'), copy = box.querySelector('#benchCopy');
-  run.onclick = async () => {
-    run.disabled = true; copy.hidden = true;
-    try { const r = await runBenchmark(m => { out.textContent = m; }); out.textContent = formatBench(r); copy.hidden = false; console.log('benchmark', JSON.stringify(r)); }
+  const out = box.querySelector('#benchOut'), run = box.querySelector('#bench'), sweep = box.querySelector('#sweep'), copy = box.querySelector('#benchCopy');
+  let lastJSON = null;
+  const go = (btn, job, fmt) => async () => {
+    run.disabled = sweep.disabled = true; copy.hidden = true;
+    try { const r = await job(m => { out.textContent = m; }); out.textContent = fmt(r); lastJSON = r; copy.hidden = false; console.log('benchmark', JSON.stringify(r)); }
     catch (e) { out.textContent = 'Benchmark failed: ' + e.message; }
-    run.disabled = false;
+    run.disabled = sweep.disabled = false;
   };
-  copy.onclick = () => { try { navigator.clipboard.writeText(JSON.stringify(bench.result, null, 2)); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy results', 1500); } catch (_) {} };
+  run.onclick = go(run, runBenchmark, formatBench);
+  sweep.onclick = go(sweep, runSweep, formatSweep);
+  copy.onclick = () => { try { navigator.clipboard.writeText(JSON.stringify(lastJSON, null, 2)); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy results', 1500); } catch (_) {} };
 }
 // ?bench in the URL runs it automatically and leaves the numbers in window.benchResult (handy for CI / comparing devices)
+if (/[?&]sweep\b/.test(location.search)) setTimeout(() => runSweep(m => { document.title = m; }).then(r => { document.title = 'sweep done'; console.log('sweep', JSON.stringify(r)); }), 500);
 if (/[?&]bench\b/.test(location.search)) setTimeout(() => runBenchmark(m => { document.title = m; }).then(r => { document.title = 'bench done'; console.log('benchmark', JSON.stringify(r)); }), 500);
 
 // ----- main loop -----------------------------------------------------------
