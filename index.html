@@ -93,6 +93,9 @@ const cfg = {
   gravity: 30,        // water mode: screen heights per second² (≈ Earth gravity for a 30 cm tank)
   ballGrowth: 0.25,   // water mode: how fast a held-down water ball grows (screen heights per second)
   sharpen: 1.06,      // water mode: interface contrast boost per frame
+  waterAlgo: 'grid',  // 'grid' = Eulerian two-phase solver on the GPU, 'flip' = FLIP particles (CPU)
+  flipRatio: 0.9,     // FLIP: 0 = pure PIC (smooth, damped), 1 = pure FLIP (lively, noisier)
+  flipIters: 40,      // FLIP: pressure solver sweeps per step
   density: 800,       // water mode: water density relative to air (real water ≈ 800)
   swirl: true,
   tiltStrength: 1,    // multiplier for device-tilt gravity
@@ -237,6 +240,9 @@ const FRAG = {
       vec4 t = texture(uTex, vUv);
       o = vec4(mix(t.x, 1.0, inside), t.yzw);
     }`,
+
+  phiClamp: HEAD + `uniform sampler2D uTex;
+    void main(){ o = vec4(clamp(texture(uTex, vUv).x, 0.0, 1.0), 0.0, 0.0, 1.0); }`,
 
   fill: HEAD + `void main(){ o = vec4(1.0 - smoothstep(0.38, 0.42, vUv.y), 0.0, 0.0, 1.0); }`,
 
@@ -455,15 +461,26 @@ const FRAG = {
     }`,
 };
 
+// Particle sprites for FLIP: each particle adds a small gaussian blob of density.
+const PVERT = `#version 300 es
+in vec2 aPos; uniform float size;
+void main(){ gl_Position = vec4(aPos * 2.0 - 1.0, 0.0, 1.0); gl_PointSize = size; }`;
+const PFRAG = `#version 300 es
+precision highp float; out vec4 o; uniform float weight;
+void main(){
+  vec2 d = (gl_PointCoord - 0.5) * 2.0; float r2 = dot(d, d);
+  if (r2 > 1.0) discard;
+  o = vec4(exp(-4.5 * r2) * weight, 0.0, 0.0, 1.0);     // sprite edge = 3 sigma
+}`;
 function compile(type, src) {
   const s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s);
   if (!gl.getShaderParameter(s, gl.COMPILE_STATUS)) fail('Shader error:\n' + gl.getShaderInfoLog(s));
   return s;
 }
 const vs = compile(gl.VERTEX_SHADER, VERT);
-function program(frag) {
+function program(frag, vert = vs) {
   const p = gl.createProgram();
-  gl.attachShader(p, vs); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, frag));
+  gl.attachShader(p, vert); gl.attachShader(p, compile(gl.FRAGMENT_SHADER, frag));
   gl.bindAttribLocation(p, 0, 'aPosition');
   gl.linkProgram(p);
   if (!gl.getProgramParameter(p, gl.LINK_STATUS)) fail('Link error:\n' + gl.getProgramInfoLog(p));
@@ -474,6 +491,7 @@ function program(frag) {
 }
 const P = {};
 for (const k in FRAG) P[k] = program(FRAG[k]);
+P.particles = program(PFRAG, compile(gl.VERTEX_SHADER, PVERT));
 
 // full-screen quad
 gl.bindBuffer(gl.ARRAY_BUFFER, gl.createBuffer());
@@ -550,6 +568,7 @@ function initBuffers() {
   curl = makeFBO(sw, sh, gl.NEAREST);
   pressure = makeDouble(sw, sh, gl.NEAREST);
   buildWater(sw, sh);
+  if (cfg.waterAlgo === 'flip') buildFlip();
 }
 // ----- water solver ----------------------------------------------------------
 // Staggered (MAC) grid, two phases. Pressure is solved from  div(beta grad p) = div u  with
@@ -606,6 +625,244 @@ function fillWater() {
   waterTarget = FILL_LEVEL;
 }
 resizeCanvas(); initBuffers();
+
+// ----- FLIP (particles + grid, on the CPU) -------------------------------------
+// Water is a cloud of particles that carry velocity. Each step: move particles, spread their velocity
+// onto a staggered grid, make the grid velocity divergence-free (Gauss-Seidel pressure solve on the
+// water cells), then copy the *change* back to the particles (FLIP) blended with the new grid velocity
+// (PIC). Particles keep volume exactly and splash without numerical smearing. Cell size = 1.
+const F_AIR = 0, F_FLUID = 1, F_SOLID = 2;
+class Flip {
+  constructor(nx, ny) {
+    this.nx = nx; this.ny = ny; this.fX = nx + 2; this.fY = ny + 2;     // +1 solid wall cell all around
+    const N = this.N = this.fX * this.fY, fX = this.fX, fY = this.fY;
+    for (const k of ['u', 'v', 'du', 'dv', 'pu', 'pv', 's', 'dens']) this[k] = new Float32Array(N);
+    this.type = new Uint8Array(N); this.rest = 0; this.k = 8; this.push = 2;   // k: strength of the volume-drift correction
+    for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
+    this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
+    this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
+    this.hCount = new Int32Array(this.hx * this.hy); this.hFirst = new Int32Array(this.hx * this.hy + 1);
+    this.maxP = Math.min(80000, Math.floor(N * 3.6)); this.ids = new Int32Array(this.maxP);
+    this.pos = new Float32Array(2 * this.maxP); this.vel = new Float32Array(2 * this.maxP); this.np = 0;
+  }
+  add(x, y, vx = 0, vy = 0) {
+    if (this.np >= this.maxP) return false;
+    const i = this.np++; this.pos[2 * i] = x; this.pos[2 * i + 1] = y; this.vel[2 * i] = vx; this.vel[2 * i + 1] = vy; return true;
+  }
+  // hexagonally packed particles at rest inside a region
+  pack(x0, y0, x1, y1, inside) {
+    const dx = 2 * this.r, dy = Math.sqrt(3) / 2 * dx; let row = 0;
+    for (let y = y0; y < y1; y += dy, row++)
+      for (let x = x0 + (row & 1 ? this.r : 0); x < x1; x += dx) if (!inside || inside(x, y)) this.add(x, y);
+  }
+  fill(level) { this.np = 0; this.rest = 0; this.u.fill(0); this.v.fill(0);
+    this.pack(1 + this.r, 1 + this.r, this.fX - 1 - this.r, 1 + level * this.ny); }
+  pushApart(iters) {
+    const { hx, hy, hCount, hFirst, ids, pos, np, invSp } = this, minD = 2 * this.r, minD2 = minD * minD;
+    hCount.fill(0);
+    for (let i = 0; i < np; i++) {
+      const xi = Math.min(Math.max(Math.floor(pos[2 * i] * invSp), 0), hx - 1), yi = Math.min(Math.max(Math.floor(pos[2 * i + 1] * invSp), 0), hy - 1);
+      hCount[xi * hy + yi]++;
+    }
+    let first = 0; const cells = hx * hy;
+    for (let i = 0; i < cells; i++) { first += hCount[i]; hFirst[i] = first; }
+    hFirst[cells] = first;
+    for (let i = 0; i < np; i++) {
+      const xi = Math.min(Math.max(Math.floor(pos[2 * i] * invSp), 0), hx - 1), yi = Math.min(Math.max(Math.floor(pos[2 * i + 1] * invSp), 0), hy - 1);
+      ids[--hFirst[xi * hy + yi]] = i;
+    }
+    for (let it = 0; it < iters; it++) for (let i = 0; i < np; i++) {
+      const px = pos[2 * i], py = pos[2 * i + 1];
+      const pxi = Math.floor(px * invSp), pyi = Math.floor(py * invSp);
+      const xa = Math.max(pxi - 1, 0), xb = Math.min(pxi + 1, hx - 1), ya = Math.max(pyi - 1, 0), yb = Math.min(pyi + 1, hy - 1);
+      for (let xi = xa; xi <= xb; xi++) for (let yi = ya; yi <= yb; yi++) {
+        const c = xi * hy + yi, end = hFirst[c + 1];
+        for (let j = hFirst[c]; j < end; j++) {
+          const id = ids[j]; if (id === i) continue;
+          let dx = pos[2 * id] - pos[2 * i], dy = pos[2 * id + 1] - pos[2 * i + 1];
+          const d2 = dx * dx + dy * dy; if (d2 > minD2 || d2 === 0) continue;
+          const d = Math.sqrt(d2), k = 0.5 * (minD - d) / d; dx *= k; dy *= k;
+          pos[2 * i] -= dx; pos[2 * i + 1] -= dy; pos[2 * id] += dx; pos[2 * id + 1] += dy;
+        }
+      }
+    }
+  }
+  transfer(toGrid, ratio) {
+    const { fX, fY, np, pos, vel, type, s } = this, n = fY;
+    if (toGrid) {
+      this.pu.set(this.u); this.pv.set(this.v); this.du.fill(0); this.dv.fill(0); this.u.fill(0); this.v.fill(0);
+      for (let i = 0; i < this.N; i++) type[i] = s[i] === 0 ? F_SOLID : F_AIR;
+      for (let i = 0; i < np; i++) {
+        const xi = Math.min(Math.max(Math.floor(pos[2 * i]), 0), fX - 1), yi = Math.min(Math.max(Math.floor(pos[2 * i + 1]), 0), fY - 1);
+        if (type[xi * n + yi] === F_AIR) type[xi * n + yi] = F_FLUID;
+      }
+    }
+    for (let comp = 0; comp < 2; comp++) {
+      const dx = comp === 0 ? 0 : 0.5, dy = comp === 0 ? 0.5 : 0;
+      const f = comp === 0 ? this.u : this.v, pf = comp === 0 ? this.pu : this.pv, d = comp === 0 ? this.du : this.dv;
+      const off = comp === 0 ? n : 1;
+      for (let i = 0; i < np; i++) {
+        const x = Math.min(Math.max(pos[2 * i], 1), fX - 1), y = Math.min(Math.max(pos[2 * i + 1], 1), fY - 1);
+        const x0 = Math.min(Math.floor(x - dx), fX - 2), tx = (x - dx) - x0, x1 = Math.min(x0 + 1, fX - 2);
+        const y0 = Math.min(Math.floor(y - dy), fY - 2), ty = (y - dy) - y0, y1 = Math.min(y0 + 1, fY - 2);
+        const sx = 1 - tx, sy = 1 - ty, d0 = sx * sy, d1 = tx * sy, d2 = tx * ty, d3 = sx * ty;
+        const n0 = x0 * n + y0, n1 = x1 * n + y0, n2 = x1 * n + y1, n3 = x0 * n + y1;
+        if (toGrid) {
+          const pv = vel[2 * i + comp];
+          f[n0] += pv * d0; d[n0] += d0; f[n1] += pv * d1; d[n1] += d1; f[n2] += pv * d2; d[n2] += d2; f[n3] += pv * d3; d[n3] += d3;
+        } else {
+          const v0 = (type[n0] !== F_AIR || type[n0 - off] !== F_AIR) ? 1 : 0, v1 = (type[n1] !== F_AIR || type[n1 - off] !== F_AIR) ? 1 : 0;
+          const v2 = (type[n2] !== F_AIR || type[n2 - off] !== F_AIR) ? 1 : 0, v3 = (type[n3] !== F_AIR || type[n3 - off] !== F_AIR) ? 1 : 0;
+          const dd = v0 * d0 + v1 * d1 + v2 * d2 + v3 * d3;
+          if (dd > 0) {
+            const pv = vel[2 * i + comp];
+            const pic = (v0 * d0 * f[n0] + v1 * d1 * f[n1] + v2 * d2 * f[n2] + v3 * d3 * f[n3]) / dd;
+            const corr = (v0 * d0 * (f[n0] - pf[n0]) + v1 * d1 * (f[n1] - pf[n1]) + v2 * d2 * (f[n2] - pf[n2]) + v3 * d3 * (f[n3] - pf[n3])) / dd;
+            vel[2 * i + comp] = (1 - ratio) * pic + ratio * (pv + corr);
+          }
+        }
+      }
+      if (toGrid) {
+        for (let i = 0; i < f.length; i++) if (d[i] > 0) f[i] /= d[i];
+        for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
+          const c = i * n + j, solid = type[c] === F_SOLID;
+          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = this.pu[c];
+          if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = this.pv[c];
+        }
+      }
+    }
+  }
+  updateDensity() {
+    const { fX, fY, np, pos, dens, type } = this, n = fY; dens.fill(0);
+    for (let i = 0; i < np; i++) {
+      const x = Math.min(Math.max(pos[2 * i], 1), fX - 1), y = Math.min(Math.max(pos[2 * i + 1], 1), fY - 1);
+      const x0 = Math.floor(x - 0.5), tx = (x - 0.5) - x0, x1 = Math.min(x0 + 1, fX - 2);
+      const y0 = Math.floor(y - 0.5), ty = (y - 0.5) - y0, y1 = Math.min(y0 + 1, fY - 2);
+      const sx = 1 - tx, sy = 1 - ty;
+      dens[x0 * n + y0] += sx * sy; dens[x1 * n + y0] += tx * sy; dens[x1 * n + y1] += tx * ty; dens[x0 * n + y1] += sx * ty;
+    }
+    if (this.rest === 0) {
+      let sum = 0, cnt = 0;
+      for (let i = 0; i < this.N; i++) if (type[i] === F_FLUID) { sum += dens[i]; cnt++; }
+      if (cnt > 0) this.rest = sum / cnt;
+    }
+  }
+  solve(iters) {
+    const { fX, fY, u, v, s, type, dens } = this, n = fY, over = 1.9, rest = this.rest;
+    this.pu.set(u); this.pv.set(v);
+    for (let it = 0; it < iters; it++) for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j; if (type[c] !== F_FLUID) continue;
+      const l = c - n, r = c + n, b = c - 1, t = c + 1;
+      const sx0 = s[l], sx1 = s[r], sy0 = s[b], sy1 = s[t], sum = sx0 + sx1 + sy0 + sy1; if (sum === 0) continue;
+      let div = u[r] - u[c] + v[t] - v[c];
+      if (rest > 0) { const comp = dens[c] - rest; if (comp > 0) div -= this.k * comp; }     // push apart over-packed regions
+      const p = -div / sum * over;
+      u[c] -= sx0 * p; u[r] += sx1 * p; v[c] -= sy0 * p; v[t] += sy1 * p;
+    }
+  }
+  substep(dt, gx, gy, ratio, iters) {
+    const { np, pos, vel } = this, minX = 1 + this.r, maxX = this.fX - 1 - this.r, minY = 1 + this.r, maxY = this.fY - 1 - this.r;
+    for (let i = 0; i < np; i++) {
+      vel[2 * i] += gx * dt; vel[2 * i + 1] += gy * dt; pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
+    }
+    this.pushApart(this.push);
+    for (let i = 0; i < np; i++) {
+      let x = pos[2 * i], y = pos[2 * i + 1];
+      if (x < minX) { x = minX; vel[2 * i] = 0; } if (x > maxX) { x = maxX; vel[2 * i] = 0; }
+      if (y < minY) { y = minY; vel[2 * i + 1] = 0; } if (y > maxY) { y = maxY; vel[2 * i + 1] = 0; }
+      pos[2 * i] = x; pos[2 * i + 1] = y;
+    }
+    this.transfer(true, 0); this.updateDensity(); this.solve(iters); this.transfer(false, ratio);
+  }
+  step(dt, gx, gy, ratio, iters) {
+    let vmax = 0; for (let i = 0; i < this.np; i++) { const a = this.vel[2 * i], b = this.vel[2 * i + 1]; vmax = Math.max(vmax, a * a + b * b); }
+    const sub = Math.min(3, Math.max(1, Math.ceil(Math.sqrt(vmax) * dt / 1.0)));   // keep particles under ~1 cell per substep
+    for (let k = 0; k < sub; k++) this.substep(dt / sub, gx, gy, ratio, iters);
+  }
+  // finger drag: add velocity to particles near (x, y) given in cell coordinates
+  stir(cx, cy, rad2, vx, vy) {
+    const { np, pos, vel } = this;
+    for (let i = 0; i < np; i++) {
+      const dx = pos[2 * i] - cx, dy = pos[2 * i + 1] - cy, w = Math.exp(-(dx * dx + dy * dy) / rad2);
+      if (w > 0.01) { vel[2 * i] += w * vx; vel[2 * i + 1] += w * vy; }
+    }
+  }
+  // a solid ball of still water replaces everything inside it
+  stamp(cx, cy, rad) {
+    const { pos, vel } = this; let k = 0; const r2 = rad * rad;
+    for (let i = 0; i < this.np; i++) {
+      const dx = pos[2 * i] - cx, dy = pos[2 * i + 1] - cy;
+      if (dx * dx + dy * dy < r2) continue;
+      if (k !== i) { pos[2 * k] = pos[2 * i]; pos[2 * k + 1] = pos[2 * i + 1]; vel[2 * k] = vel[2 * i]; vel[2 * k + 1] = vel[2 * i + 1]; } k++;
+    }
+    this.np = k;
+    this.pack(Math.max(1 + this.r, cx - rad), Math.max(1 + this.r, cy - rad), Math.min(this.fX - 1 - this.r, cx + rad), Math.min(this.fY - 1 - this.r, cy + rad),
+      (x, y) => (x - cx) * (x - cx) + (y - cy) * (y - cy) < r2);
+    this.rest = 0;
+  }
+}
+
+const FL = { sim: null, dens: null, texU: null, texV: null, vao: null, vbo: null, uv: null, ubuf: null, vbuf: null };
+function floatTex(w, h) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.R16F, w, h, 0, gl.RED, gl.FLOAT, null);
+  return { tex, w, h, destroy() { gl.deleteTexture(tex); } };
+}
+function buildFlip() {
+  const short = [24, 32, 48, 64, 96][cfg.level], [nx, ny] = gridSize(short), old = FL.sim;
+  if (!old || old.nx !== nx || old.ny !== ny) {
+    const f = new Flip(nx, ny);
+    if (!old) f.fill(FILL_LEVEL);
+    else {                          // keep the water: re-map particles (thinning / duplicating them to suit the new resolution)
+      const k = (nx * ny) / (old.nx * old.ny);
+      for (let i = 0; i < old.np; i++) {
+        const u = (old.pos[2 * i] - 1) / old.nx, v = (old.pos[2 * i + 1] - 1) / old.ny, vs = ny / old.ny;
+        let copies = Math.floor(k) + (Math.random() < k - Math.floor(k) ? 1 : 0);
+        for (let c = 0; c < copies; c++) f.add(1 + u * nx + (c ? (Math.random() - 0.5) * 0.4 : 0), 1 + v * ny + (c ? (Math.random() - 0.5) * 0.4 : 0), old.vel[2 * i] * vs, old.vel[2 * i + 1] * vs);
+      }
+    }
+    FL.sim = f;
+    if (FL.texU) { FL.texU.destroy(); FL.texV.destroy(); gl.deleteBuffer(FL.vbo); }
+    FL.texU = floatTex(nx + 1, ny); FL.texV = floatTex(nx, ny + 1);
+    FL.ubuf = new Float32Array((nx + 1) * ny); FL.vbuf = new Float32Array(nx * (ny + 1));
+    FL.uv = new Float32Array(2 * f.maxP);
+    FL.vbo = gl.createBuffer(); gl.bindBuffer(gl.ARRAY_BUFFER, FL.vbo); gl.bufferData(gl.ARRAY_BUFFER, FL.uv.byteLength, gl.DYNAMIC_DRAW);
+    FL.vao = FL.vao || gl.createVertexArray(); gl.bindVertexArray(FL.vao);
+    gl.bindBuffer(gl.ARRAY_BUFFER, FL.vbo); gl.enableVertexAttribArray(0); gl.vertexAttribPointer(0, 2, gl.FLOAT, false, 0, 0);
+    gl.bindVertexArray(null);
+  }
+  if (FL.dens) FL.dens.destroy();
+  FL.dens = makeFBO(water.read.w, water.read.h, gl.LINEAR);
+}
+function fillFlip() { FL.sim.fill(FILL_LEVEL); }
+
+function stepFlip(dt) {
+  const f = FL.sim, nx = f.nx, ny = f.ny, gm = cfg.gravity * ny * (tilt.on ? cfg.tiltStrength : 1);
+  f.step(dt, grav.x * gm, grav.y * gm, cfg.flipRatio, cfg.flipIters);
+
+  // grid velocities -> small textures (only used for foam in the renderer)
+  const { u, v, fY } = f;
+  for (let j = 0; j < ny; j++) for (let i = 0; i <= nx; i++) FL.ubuf[j * (nx + 1) + i] = u[(i + 1) * fY + j + 1];
+  for (let j = 0; j <= ny; j++) for (let i = 0; i < nx; i++) FL.vbuf[j * nx + i] = v[(i + 1) * fY + j + 1];
+  gl.bindTexture(gl.TEXTURE_2D, FL.texU.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, nx + 1, ny, gl.RED, gl.FLOAT, FL.ubuf);
+  gl.bindTexture(gl.TEXTURE_2D, FL.texV.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, nx, ny + 1, gl.RED, gl.FLOAT, FL.vbuf);
+
+  // particles -> density field -> fill fraction
+  for (let i = 0; i < f.np; i++) { FL.uv[2 * i] = (f.pos[2 * i] - 1) / nx; FL.uv[2 * i + 1] = (f.pos[2 * i + 1] - 1) / ny; }
+  gl.bindBuffer(gl.ARRAY_BUFFER, FL.vbo); gl.bufferSubData(gl.ARRAY_BUFFER, 0, FL.uv, 0, 2 * f.np);
+  clearFB(FL.dens);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, FL.dens.fbo); gl.viewport(0, 0, FL.dens.w, FL.dens.h);
+  const SIGMA = 0.55, cellPx = FL.dens.w / nx;
+  gl.useProgram(P.particles.p);
+  gl.uniform1f(P.particles.u.size, Math.max(2, 6 * SIGMA * cellPx));
+  gl.uniform1f(P.particles.u.weight, 1 / (f.rest > 0 ? 1.6 * 2 * Math.PI * SIGMA * SIGMA * 3.2 / 3.2 * 1.0 : 6.1));   // ~1 inside the water
+  gl.enable(gl.BLEND); gl.blendFunc(gl.ONE, gl.ONE);
+  gl.bindVertexArray(FL.vao); gl.drawArrays(gl.POINTS, 0, f.np); gl.bindVertexArray(null);
+  gl.disable(gl.BLEND);
+  texUnit = 0; const c = use(P.phiClamp); bindTex(c.uTex, FL.dens); blit(water.write); water.swap();
+}
 
 // ----- simulation step -----------------------------------------------------
 function step(dt) {
@@ -694,9 +951,9 @@ function stepWater(dt) {
 
 function render() {
   if (cfg.mode === 'water') {
-    const [W, H] = WS.grid;
+    const flip = cfg.waterAlgo === 'flip', [W, H] = flip ? [FL.sim.nx, FL.sim.ny] : WS.grid;
     texUnit = 0; const w = use(P.displayWater, water.read.texel);
-    bindTex(w.uWater, water.read); bindTex(w.uU, WS.U.read); bindTex(w.uV, WS.V.read);
+    bindTex(w.uWater, water.read); bindTex(w.uU, flip ? FL.texU : WS.U.read); bindTex(w.uV, flip ? FL.texV : WS.V.read);
     const bd = new Float32Array(12); let bi = 0;
     for (const p of pointers.values()) if (p.hold && p.hold.on && p.hold.r > 0 && bi < 4) { bd.set([p.x, p.y, p.hold.r], bi * 3); bi++; }
     gl.uniform3fv(w['balls[0]'], bd); gl.uniform1f(w.aspect, canvas.width / canvas.height);
@@ -710,6 +967,7 @@ function render() {
 
 // Drop a solid ball of water into the simulation, replacing whatever was there (and its motion).
 function stampBall(x, y, r) {
+  if (cfg.waterAlgo === 'flip') { const f = FL.sim; f.stamp(1 + x * f.nx, 1 + y * f.ny, r * f.ny); return; }
   const aspect = canvas.width / canvas.height, [W, H] = WS.grid;
   texUnit = 0; let u = use(P.stampPhi); bindTex(u.uTex, water.read);
   gl.uniform2f(u.point, x, y); gl.uniform1f(u.aspect, aspect); gl.uniform1f(u.radius, r);
@@ -741,6 +999,11 @@ function splatInto(target, x, y, a, b, c, radius) {
 function splatRadius() { const aspect = canvas.width / canvas.height; return (cfg.splatRadius / 100) * (aspect > 1 ? aspect : 1); }
 function splat(x, y, dx, dy, color) {
   const radius = splatRadius();
+  if (cfg.mode === 'water' && cfg.waterAlgo === 'flip') {
+    const f = FL.sim, k = f.ny / WS.grid[1];       // push velocities are given in (grid-solver cells)/s; convert to FLIP cells
+    f.stir(1 + x * f.nx, 1 + y * f.ny, radius * f.ny * f.ny, dx * k, dy * k);
+    return;
+  }
   if (cfg.mode === 'water') {
     const [W, H] = WS.grid, aspect = canvas.width / canvas.height;
     for (const [kind, amount, T] of [[0, dx, WS.U], [1, dy, WS.V]]) {
@@ -853,7 +1116,7 @@ function applyTilt(dt) {
     splatInto(velocity, x, y, tilt.gx * f * 0.02, tilt.gy * f * 0.02, 0, 0.35);
 }
 
-$('clear').onclick = () => { [velocity, dye, pressure, water].forEach(d => { clearFB(d.read); clearFB(d.write); }); clearWaterFlow(); fillWater(); };
+$('clear').onclick = () => { [velocity, dye, pressure, water].forEach(d => { clearFB(d.read); clearFB(d.write); }); clearWaterFlow(); fillWater(); if (FL.sim) fillFlip(); };
 function setMode(m, fromPreset = true) {
   cfg.mode = m; if (fromPreset) Object.assign(cfg, PRESETS[m]);
   $('mode').textContent = 'Mode: ' + (m === 'water' ? 'Water' : 'Dye');
@@ -866,35 +1129,48 @@ $('swirl').onclick = e => { cfg.swirl = !cfg.swirl; e.target.textContent = 'Swir
 window.addEventListener('resize', () => { if (resizeCanvas()) initBuffers(); });
 
 // ----- settings panel --------------------------------------------------------
-const W_ = ['water'], D_ = ['dye'];
+const W_ = ['water'], D_ = ['dye'], GRID = ['grid'], FLIPA = ['flip'];
 const SCHEMA = [
   { k: 'gravity', label: 'Gravity', min: 0, max: 40, step: 0.5, modes: W_, hint: 'Screen heights per second². Earth-like for a ~30 cm tank is about 30.' },
-  { k: 'density', label: 'Water density vs air', min: 2, max: 1000, step: 1, log: true, modes: W_,
+  { k: 'flipRatio', label: 'FLIP blend (0 = smooth PIC, 1 = splashy FLIP)', min: 0, max: 1, step: 0.01, modes: W_, algos: FLIPA },
+  { k: 'flipIters', label: 'Pressure iterations (CPU cost)', min: 10, max: 120, step: 5, modes: W_, algos: FLIPA,
+    hint: 'More = water behaves more incompressibly, but costs more CPU.' },
+  { k: 'density', label: 'Water density vs air', min: 2, max: 1000, step: 1, log: true, modes: W_, algos: GRID,
     hint: 'Real water is ≈ 800× denser than air. Lower = lighter water, faster but floatier splashes.' },
   { k: 'ballGrowth', label: 'Water ball growth speed', min: 0.05, max: 1, step: 0.05, modes: W_ },
   { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1, modes: W_ },
   { k: 'curl', label: 'Swirliness (vorticity)', min: 0, max: 60, step: 1, modes: D_ },
   { k: 'densityDissipation', label: 'Dye fade', min: 0, max: 4, step: 0.05, modes: D_ },
   { k: 'dyeIntensity', label: 'Dye amount', min: 0.02, max: 0.6, step: 0.01, modes: D_ },
-  { k: 'velocityDissipation', label: 'Velocity damping', min: 0, max: 4, step: 0.05 },
-  { k: 'pressure', label: 'Pressure persistence', min: 0, max: 1, step: 0.01 },
+  { k: 'velocityDissipation', label: 'Velocity damping', min: 0, max: 4, step: 0.05, algos: GRID },
+  { k: 'pressure', label: 'Pressure persistence', min: 0, max: 1, step: 0.01, algos: GRID },
   { k: 'splatRadius', label: 'Brush size', min: 0.05, max: 1, step: 0.01 },
   { k: 'splatForce', label: 'Stir force', min: 500, max: 20000, step: 100 },
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg4';
+const KEY = 'fluidCfg5';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
 const panel = $('panel'), widgets = {};
 function addRow(html) { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = html; panel.appendChild(d); return d; }
 const rows = [];
+{
+  const r = addRow(`<label>Water algorithm</label><span></span><select style="grid-column:1/-1;font:inherit;padding:8px;border-radius:8px;background:#ffffff1f;color:#fff;border:1px solid #ffffff2e">
+    <option value="grid" style="color:#000">Grid — two-phase solver (GPU)</option>
+    <option value="flip" style="color:#000">FLIP — particles + grid (CPU)</option></select>
+    <small style="grid-column:1/-1;color:#fff8">They are different methods with different looks and costs. Switching refills the tank.</small>`);
+  r.dataset.modes = 'water'; r.dataset.algos = 'grid flip'; rows.push(r);
+  const sel = r.querySelector('select'); sel.value = cfg.waterAlgo;
+  sel.onchange = () => { setAlgo(sel.value); save(); };
+  widgets.waterAlgo = () => { sel.value = cfg.waterAlgo; };
+}
 for (const s of SCHEMA) {
   const lo = s.log ? 0 : s.min, hi = s.log ? 1 : s.max, st = s.log ? 0.001 : s.step;
   const row = addRow(`<label>${s.label}</label><output></output><input type="range" min="${lo}" max="${hi}" step="${st}">`
     + (s.hint ? `<small style="grid-column:1/-1;color:#fff8;margin-top:-2px">${s.hint}</small>` : ''));
-  row.dataset.modes = (s.modes || ['dye', 'water']).join(' '); rows.push(row);
+  row.dataset.modes = (s.modes || ['dye', 'water']).join(' '); row.dataset.algos = (s.algos || ['grid', 'flip']).join(' '); rows.push(row);
   const inp = row.querySelector('input'), out = row.querySelector('output');
   const fmt = v => s.log ? (v >= 100 ? Math.round(v) : +v.toPrecision(2)) + '×' : +(+v).toFixed(2);
   const toVal = t => s.log ? Math.round(s.min * Math.pow(s.max / s.min, t) * 10) / 10 : t;
@@ -905,7 +1181,7 @@ for (const s of SCHEMA) {
 }
 {
   const dRow = rows[SCHEMA.findIndex(x => x.k === 'density')];
-  const box = document.createElement('div'); box.className = 'row'; box.dataset.modes = 'water'; box.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
+  const box = document.createElement('div'); box.className = 'row'; box.dataset.modes = 'water'; box.dataset.algos = 'grid'; box.dataset.disp = 'flex'; box.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
   for (const [label, v] of [['Real water (800×)', 800], ['Balanced (100×)', 100], ['Light & fast (16×)', 16]]) {
     const b = document.createElement('button'); b.textContent = label;
     b.onclick = () => { cfg.density = v; widgets.density(); save(); };
@@ -913,8 +1189,18 @@ for (const s of SCHEMA) {
   }
   dRow.after(box); rows.push(box);
 }
+function setAlgo(a) {
+  cfg.waterAlgo = a;
+  if (a === 'flip') { if (!FL.sim) buildFlip(); fillFlip(); }
+  else { [velocity, dye, pressure, water].forEach(d => { clearFB(d.read); clearFB(d.write); }); clearWaterFlow(); fillWater(); }
+  if (widgets.waterAlgo) widgets.waterAlgo();
+  applyModeVisibility();
+}
 function applyModeVisibility() {      // only show the settings that matter for the current mode
-  for (const r of rows) r.style.display = r.dataset.modes.split(' ').includes(cfg.mode) ? (r.dataset.modes === 'water' && r.style.cssText.includes('flex') ? 'flex' : '') : 'none';
+  for (const r of rows) {
+    const show = r.dataset.modes.split(' ').includes(cfg.mode) && (cfg.mode !== 'water' || r.dataset.algos.split(' ').includes(cfg.waterAlgo));
+    r.style.display = show ? (r.dataset.disp || '') : 'none';
+  }
   $('swirl').style.display = cfg.mode === 'dye' ? '' : 'none';
 }
 {
@@ -937,6 +1223,7 @@ function applyModeVisibility() {      // only show the settings that matter for 
   panel.appendChild(b);
 }
 setMode(cfg.mode, false);
+if (cfg.waterAlgo === 'flip' && !FL.sim) buildFlip();
 $('gear').onclick = () => { document.body.classList.toggle('panel', panel.classList.toggle('open')); };
 
 // ----- adaptive quality ----------------------------------------------------
@@ -966,7 +1253,7 @@ function frame(now) {
     randomSplat(0.8); nextAuto = now + 1200 + Math.random() * 1500;
   }
   updateGravity(dt); applyPointers(dt); applyTilt(dt);
-  if (cfg.mode === 'water') stepWater(dt); else step(dt);
+  if (cfg.mode === 'water') { if (cfg.waterAlgo === 'flip') stepFlip(dt); else stepWater(dt); } else step(dt);
   render();
   if (raw < 0.5) adapt(raw);              // ignore tab-switch hiccups
   requestAnimationFrame(frame);
