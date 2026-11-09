@@ -1115,11 +1115,134 @@ function adapt(rawDt) {
   $('stats').textContent = `${Math.round(perf.fps)} fps · sim ${L.sim} · surface ${L.tex}`;
 }
 
+// ----- benchmark ---------------------------------------------------------------
+// Runs the same scripted scene on both algorithms with a fixed time step (so results are comparable
+// between runs and devices): a pool at rest, a ball of water dropped in, then settling. It reports how
+// long each frame takes (simulation and drawing, synced with the GPU, so vsync doesn't hide it) and
+// how well the water behaves (time to settle, leftover motion, volume drift).
+const bench = { on: false, result: null };
+const yieldUI = () => new Promise(r => setTimeout(r, 0));
+const pct = (a, p) => { const b = [...a].sort((x, y) => x - y); return b[Math.min(b.length - 1, Math.floor(b.length * p))]; };
+const avg = a => a.reduce((x, y) => x + y, 0) / Math.max(1, a.length);
+function readRGBA(fb) {
+  gl.bindFramebuffer(gl.FRAMEBUFFER, fb.fbo);
+  const a = new Float32Array(fb.w * fb.h * 4); gl.readPixels(0, 0, fb.w, fb.h, gl.RGBA, gl.FLOAT, a); return a;
+}
+// gl.finish() is a no-op in some browsers; reading one pixel back really waits for the GPU
+const px1 = new Float32Array(4), px8 = new Uint8Array(4);
+function syncGPU(fb) {
+  try {
+    if (fb) { gl.bindFramebuffer(gl.FRAMEBUFFER, fb.fbo); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.FLOAT, px1); }
+    else { gl.bindFramebuffer(gl.FRAMEBUFFER, null); gl.readPixels(0, 0, 1, 1, gl.RGBA, gl.UNSIGNED_BYTE, px8); }
+  } catch (_) { gl.finish(); }
+}
+function benchSpeed(algo) {                       // RMS water speed, in screen heights per second
+  try {
+    if (algo === 'flip') {
+      const f = FL.sim; let k = 0; for (let i = 0; i < f.np; i++) k += f.vel[2 * i] ** 2 + f.vel[2 * i + 1] ** 2;
+      return Math.sqrt(k / Math.max(1, f.np)) / f.ny;
+    }
+    let k = 0, n = 0;
+    for (const T of [WS.U.read, WS.V.read]) { const a = readRGBA(T); for (let i = 0; i < a.length; i += 4) { k += a[i] * a[i]; n++; } }
+    return Math.sqrt(k / n) / WS.grid[1];
+  } catch (_) { return NaN; }
+}
+function benchVolume(algo) {                      // water volume as a fraction of the tank
+  try {
+    if (algo === 'flip') return FL.sim.np / (FL.sim.nx * FL.sim.ny * 3.2);
+    const a = readRGBA(massTex); let k = 0; for (let i = 0; i < a.length; i += 4) k += a[i]; return k / (massTex.w * massTex.h);
+  } catch (_) { return NaN; }
+}
+async function benchAlgo(algo, progress) {
+  setAlgo(algo); tilt.on = false; grav.x = 0; grav.y = -1; pointers.clear();
+  const dt = 1 / 60, run = algo === 'flip' ? stepFlip : stepWater, stepMs = [], drawMs = [];
+  const one = (record) => {
+    const t0 = performance.now(); run(dt); syncGPU(water); const t1 = performance.now(); render(); syncGPU(null); const t2 = performance.now();
+    if (record) { stepMs.push(t1 - t0); drawMs.push(t2 - t1); }
+  };
+  progress(`${algo}: warming up…`);
+  for (let i = 0; i < 40; i++) { one(false); if (i % 8 === 7) await yieldUI(); }
+  const restSpeed = benchSpeed(algo);
+  stampBall(0.5, 0.75, 0.12);                     // the scripted splash
+  const vol0 = benchVolume(algo);
+  let settle = null, t = 0, last = NaN;
+  for (let i = 0; i < 540; i++) {
+    one(i < 120); t += dt;                        // timing is recorded over the first 2 s of splash
+    if (i % 6 === 5) {
+      last = benchSpeed(algo);
+      if (settle === null && i > 30 && last < 0.05) settle = t;
+    }
+    if (i % 8 === 7) { progress(`${algo}: ${Math.round(100 * i / 540)}%`); await yieldUI(); }
+  }
+  const vol1 = benchVolume(algo), frame = stepMs.map((v, i) => v + drawMs[i]);
+  return {
+    algorithm: algo,
+    particles: algo === 'flip' ? FL.sim.np : null,
+    grid: algo === 'flip' ? [FL.sim.nx, FL.sim.ny] : WS.grid.slice(),
+    msPerFrame: { avg: +avg(frame).toFixed(2), p95: +pct(frame, 0.95).toFixed(2), worst: +Math.max(...frame).toFixed(2) },
+    stepMsAvg: +avg(stepMs).toFixed(2), drawMsAvg: +avg(drawMs).toFixed(2),
+    maxFps: Math.round(1000 / avg(frame)),
+    restSpeedBefore: +restSpeed.toFixed(4),
+    settleSeconds: settle === null ? null : +settle.toFixed(2),
+    speedAtEnd: +last.toFixed(4),
+    volumeDriftPercent: +(100 * (vol1 - vol0) / vol0).toFixed(2),
+  };
+}
+async function runBenchmark(progress = () => {}) {
+  const saved = { algo: cfg.waterAlgo, auto: cfg.auto };
+  bench.on = true; cfg.auto = false;
+  const ext = gl.getExtension('WEBGL_debug_renderer_info');
+  const out = {
+    when: new Date().toISOString(), userAgent: navigator.userAgent, cores: navigator.hardwareConcurrency || null,
+    gpu: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'unknown', pixelRatio: window.devicePixelRatio,
+    canvas: [canvas.width, canvas.height], level: cfg.level, settings: { gravity: cfg.gravity, density: cfg.density, flipRatio: cfg.flipRatio, flipIters: cfg.flipIters },
+    results: {},
+  };
+  try { for (const algo of ['grid', 'flip']) out.results[algo] = await benchAlgo(algo, progress); }
+  finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
+  bench.result = out; window.benchResult = out;
+  return out;
+}
+function formatBench(r) {
+  const g = r.results.grid, f = r.results.flip, row = (label, a, b) => label.padEnd(26) + String(a).padStart(10) + String(b).padStart(10);
+  const n = v => v === null ? '>9s' : v;
+  return [`GPU: ${r.gpu}`, `Level ${r.level}, canvas ${r.canvas.join('x')}, ${r.cores ?? '?'} cores`, '',
+    row('', 'Grid', 'FLIP'),
+    row('max fps (GPU-synced)', g.maxFps, f.maxFps),
+    row('ms/frame avg', g.msPerFrame.avg, f.msPerFrame.avg),
+    row('  simulation', g.stepMsAvg, f.stepMsAvg),
+    row('  drawing', g.drawMsAvg, f.drawMsAvg),
+    row('ms/frame p95', g.msPerFrame.p95, f.msPerFrame.p95),
+    row('ms/frame worst', g.msPerFrame.worst, f.msPerFrame.worst),
+    row('particles', g.particles ?? '-', f.particles),
+    row('settle time (s)', n(g.settleSeconds), n(f.settleSeconds)),
+    row('speed at end (h/s)', g.speedAtEnd, f.speedAtEnd),
+    row('volume drift %', g.volumeDriftPercent, f.volumeDriftPercent)].join('\n');
+}
+{
+  const box = document.createElement('div'); box.className = 'row'; box.style.cssText = 'display:block';
+  box.innerHTML = `<button id="bench">Run benchmark (~30 s)</button> <button id="benchCopy" hidden>Copy results</button>
+    <pre id="benchOut" style="white-space:pre-wrap;font:11px/1.35 ui-monospace,monospace;color:#fffc;margin:10px 0 0"></pre>
+    <small style="color:#fff8">Runs a scripted splash on both algorithms at the current resolution level with a fixed time step. Keep the tab in front and leave the phone alone.</small>`;
+  const reset = panel.lastChild; panel.insertBefore(box, reset);
+  const out = box.querySelector('#benchOut'), run = box.querySelector('#bench'), copy = box.querySelector('#benchCopy');
+  run.onclick = async () => {
+    run.disabled = true; copy.hidden = true;
+    try { const r = await runBenchmark(m => { out.textContent = m; }); out.textContent = formatBench(r); copy.hidden = false; console.log('benchmark', JSON.stringify(r)); }
+    catch (e) { out.textContent = 'Benchmark failed: ' + e.message; }
+    run.disabled = false;
+  };
+  copy.onclick = () => { try { navigator.clipboard.writeText(JSON.stringify(bench.result, null, 2)); copy.textContent = 'Copied'; setTimeout(() => copy.textContent = 'Copy results', 1500); } catch (_) {} };
+}
+// ?bench in the URL runs it automatically and leaves the numbers in window.benchResult (handy for CI / comparing devices)
+if (/[?&]bench\b/.test(location.search)) setTimeout(() => runBenchmark(m => { document.title = m; }).then(r => { document.title = 'bench done'; console.log('benchmark', JSON.stringify(r)); }), 500);
+
 // ----- main loop -----------------------------------------------------------
 let last = performance.now();
 function frame(now) {
   const raw = (now - last) / 1000; last = now;
   const dt = Math.min(Math.max(raw, 0.001), 1 / 30);
+  if (bench.on) { requestAnimationFrame(frame); return; }          // the benchmark drives the simulation itself
   updateGravity(dt); applyPointers(dt);
   if (cfg.waterAlgo === 'flip') stepFlip(dt); else stepWater(dt);
   render();
