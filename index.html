@@ -69,6 +69,7 @@ if (!gl) fail('This demo needs WebGL2, which your browser does not support.');
 if (!gl.getExtension('EXT_color_buffer_float') && !gl.getExtension('EXT_color_buffer_half_float'))
   fail('Your GPU cannot render to floating-point textures.');
 gl.getExtension('OES_texture_float_linear');
+const CAN_F32 = !!gl.getExtension('EXT_color_buffer_float');   // 32-bit pressure needed for large water/air density ratios
 
 // Quality ladder: [simulation grid, dye grid, pressure iterations]
 const LEVELS = [
@@ -89,10 +90,10 @@ const cfg = {
   level: 2,
   auto: true,
   ...PRESETS.water,
-  gravity: 10,        // water mode: screen-heights per second squared
+  gravity: 30,        // water mode: screen heights per second² (≈ Earth gravity for a 30 cm tank)
   ballGrowth: 0.25,   // water mode: how fast a held-down water ball grows (screen heights per second)
   sharpen: 1.06,      // water mode: interface contrast boost per frame
-  density: 16,        // water mode: water density relative to air (real life ~800; higher = heavier, stiffer solve)
+  density: 800,       // water mode: water density relative to air (real water ≈ 800)
   swirl: true,
   tiltStrength: 1,    // multiplier for device-tilt gravity
   maxDpr: 1.5,
@@ -181,8 +182,17 @@ const FRAG = {
       o = vec4((L + R + B + T - d) * 0.25, 0.0, 0.0, 1.0);
     }`,
 
+  // fine pressure += bilinearly interpolated coarse correction (manual, so 32-bit float textures work unfiltered)
   prolong: HEAD + `uniform sampler2D uP, uE;
-    void main(){ o = vec4(texture(uP, vUv).x + texture(uE, vUv).x, 0.0, 0.0, 1.0); }`,
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy), nf = textureSize(uP, 0), nc = textureSize(uE, 0);
+      vec2 q = (vec2(c) + 0.5) * vec2(nc) / vec2(nf) - 0.5;
+      ivec2 i0 = ivec2(floor(q)); vec2 f = q - vec2(i0);
+      ivec2 a = clamp(i0, ivec2(0), nc - 1), b = clamp(i0 + 1, ivec2(0), nc - 1);
+      float e = mix(mix(texelFetch(uE, ivec2(a.x, a.y), 0).x, texelFetch(uE, ivec2(b.x, a.y), 0).x, f.x),
+                    mix(texelFetch(uE, ivec2(a.x, b.y), 0).x, texelFetch(uE, ivec2(b.x, b.y), 0).x, f.x), f.y);
+      o = vec4(texelFetch(uP, c, 0).x + e, 0.0, 0.0, 1.0);
+    }`,
 
   gradient: HEAD + `uniform sampler2D uPressure, uVelocity;
     void main(){
@@ -241,8 +251,8 @@ const FRAG = {
     }`,
 
   // Face coefficients beta = 1/density between neighbouring cells (0 at solid walls).
-  beta: HEAD + `uniform sampler2D uPhi; uniform float rhoW;
-    float rho(ivec2 c){ return mix(1.0, rhoW, clamp(texelFetch(uPhi, c, 0).x, 0.0, 1.0)); }
+  beta: HEAD + `uniform sampler2D uPhi; uniform float rhoA;     // water density = 1, air density = rhoA (= 1 / ratio)
+    float rho(ivec2 c){ return mix(rhoA, 1.0, clamp(texelFetch(uPhi, c, 0).x, 0.0, 1.0)); }
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uPhi, 0);
       float r = rho(c);
@@ -485,14 +495,15 @@ let texUnit = 0;
 function bindTex(loc, fb) { gl.activeTexture(gl.TEXTURE0 + texUnit); gl.bindTexture(gl.TEXTURE_2D, fb.tex); gl.uniform1i(loc, texUnit++); }
 
 // ----- framebuffers --------------------------------------------------------
-function makeFBO(w, h, filter, mips = false) {
+function makeFBO(w, h, filter, mips = false, f32 = false) {
   const tex = gl.createTexture();
   gl.bindTexture(gl.TEXTURE_2D, tex);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, mips ? gl.LINEAR_MIPMAP_NEAREST : filter);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
+  if (f32) gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA32F, w, h, 0, gl.RGBA, gl.FLOAT, null);
+  else gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA16F, w, h, 0, gl.RGBA, gl.HALF_FLOAT, null);
   const fbo = gl.createFramebuffer();
   gl.bindFramebuffer(gl.FRAMEBUFFER, fbo);
   gl.framebufferTexture2D(gl.FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, tex, 0);
@@ -502,8 +513,8 @@ function makeFBO(w, h, filter, mips = false) {
   return { tex, fbo, w, h, texel: [1 / w, 1 / h], destroy() { gl.deleteTexture(tex); gl.deleteFramebuffer(fbo); } };
 }
 function genMips(fb) { gl.bindTexture(gl.TEXTURE_2D, fb.tex); gl.generateMipmap(gl.TEXTURE_2D); }
-function makeDouble(w, h, filter, mips = false) {
-  const d = { read: makeFBO(w, h, filter, mips), write: makeFBO(w, h, filter, mips),
+function makeDouble(w, h, filter, mips = false, f32 = false) {
+  const d = { read: makeFBO(w, h, filter, mips, f32), write: makeFBO(w, h, filter, mips, f32),
     swap() { const t = this.read; this.read = this.write; this.write = t; },
     destroy() { this.read.destroy(); this.write.destroy(); } };
   return d;
@@ -553,7 +564,9 @@ function buildWater(w, h) {
   WS.phi = makeFBO(w, h, gl.LINEAR);
   WS.lv = [];
   for (;;) {
-    WS.lv.push({ w, h, p: makeDouble(w, h, gl.LINEAR), d: makeFBO(w, h, gl.LINEAR), b: makeFBO(w, h, gl.LINEAR), r: makeFBO(w, h, gl.LINEAR) });
+    // pressure scales with density x gravity x depth (thousands), far beyond half-float precision -> 32-bit
+    WS.lv.push({ w, h, p: makeDouble(w, h, gl.NEAREST, false, CAN_F32), d: makeFBO(w, h, gl.NEAREST, false, CAN_F32),
+                 b: makeFBO(w, h, gl.NEAREST, false, CAN_F32), r: makeFBO(w, h, gl.NEAREST, false, CAN_F32) });
     if (WS.lv.length >= 7 || Math.min(w, h) <= 5) break;
     w = Math.ceil(w / 2); h = Math.ceil(h / 2);
   }
@@ -655,11 +668,13 @@ function stepWater(dt) {
   }
 
   // pressure projection with density-dependent coefficients
-  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.rhoW, cfg.density); blit(L0.b);
+  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.rhoA, 1 / Math.min(cfg.density, CAN_F32 ? 2000 : 30)); blit(L0.b);
   for (let l = 0; l + 1 < WS.lv.length; l++) { texUnit = 0; u = use(P.restrictBetaW); bindTex(u.uB, WS.lv[l].b); blit(WS.lv[l + 1].b); }
   texUnit = 0; u = use(P.divMAC); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); blit(L0.d);
   texUnit = 0; u = use(P.clear); bindTex(u.uTex, L0.p.read); gl.uniform1f(u.value, cfg.pressure); blit(L0.p.write); L0.p.swap();
-  wvcycle(0, 3, 3); wvcycle(0, 2, 2);
+  // heavier water (bigger density jump between water and air) needs more V-cycles to settle hydrostatic pressure
+  const cycles = cfg.density > 200 ? 4 : cfg.density > 40 ? 3 : 2;
+  for (let i = 0; i < cycles; i++) wvcycle(0, 3, 3);
   texUnit = 0; u = use(P.projectU); bindTex(u.uU, WS.U.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); blit(WS.U.write);
   texUnit = 0; u = use(P.projectV); bindTex(u.uV, WS.V.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); blit(WS.V.write);
   WS.U.swap(); WS.V.swap();
@@ -843,6 +858,7 @@ function setMode(m, fromPreset = true) {
   cfg.mode = m; if (fromPreset) Object.assign(cfg, PRESETS[m]);
   $('mode').textContent = 'Mode: ' + (m === 'water' ? 'Water' : 'Dye');
   for (const k in widgets) widgets[k]();
+  applyModeVisibility();
 }
 $('mode').onclick = () => { setMode(cfg.mode === 'water' ? 'dye' : 'water'); save(); };
 $('swirl').onclick = e => { cfg.swirl = !cfg.swirl; e.target.textContent = 'Swirl: ' + (cfg.swirl ? 'on' : 'off'); };
@@ -850,34 +866,56 @@ $('swirl').onclick = e => { cfg.swirl = !cfg.swirl; e.target.textContent = 'Swir
 window.addEventListener('resize', () => { if (resizeCanvas()) initBuffers(); });
 
 // ----- settings panel --------------------------------------------------------
+const W_ = ['water'], D_ = ['dye'];
 const SCHEMA = [
-  { k: 'curl', label: 'Swirliness (vorticity)', min: 0, max: 60, step: 1 },
+  { k: 'gravity', label: 'Gravity', min: 0, max: 40, step: 0.5, modes: W_, hint: 'Screen heights per second². Earth-like for a ~30 cm tank is about 30.' },
+  { k: 'density', label: 'Water density vs air', min: 2, max: 1000, step: 1, log: true, modes: W_,
+    hint: 'Real water is ≈ 800× denser than air. Lower = lighter water, faster but floatier splashes.' },
+  { k: 'ballGrowth', label: 'Water ball growth speed', min: 0.05, max: 1, step: 0.05, modes: W_ },
+  { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1, modes: W_ },
+  { k: 'curl', label: 'Swirliness (vorticity)', min: 0, max: 60, step: 1, modes: D_ },
+  { k: 'densityDissipation', label: 'Dye fade', min: 0, max: 4, step: 0.05, modes: D_ },
+  { k: 'dyeIntensity', label: 'Dye amount', min: 0.02, max: 0.6, step: 0.01, modes: D_ },
   { k: 'velocityDissipation', label: 'Velocity damping', min: 0, max: 4, step: 0.05 },
-  { k: 'densityDissipation', label: 'Dye fade', min: 0, max: 4, step: 0.05 },
   { k: 'pressure', label: 'Pressure persistence', min: 0, max: 1, step: 0.01 },
   { k: 'splatRadius', label: 'Brush size', min: 0.05, max: 1, step: 0.01 },
   { k: 'splatForce', label: 'Stir force', min: 500, max: 20000, step: 100 },
-  { k: 'dyeIntensity', label: 'Dye amount', min: 0.02, max: 0.6, step: 0.01 },
-  { k: 'gravity', label: 'Water gravity', min: 0, max: 40, step: 0.5 },
-  { k: 'ballGrowth', label: 'Water ball growth speed', min: 0.05, max: 1, step: 0.05 },
-  { k: 'density', label: 'Water density (vs air)', min: 2, max: 60, step: 1 },
-  { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1 },
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg3';
+const KEY = 'fluidCfg4';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
 const panel = $('panel'), widgets = {};
 function addRow(html) { const d = document.createElement('div'); d.className = 'row'; d.innerHTML = html; panel.appendChild(d); return d; }
+const rows = [];
 for (const s of SCHEMA) {
-  const row = addRow(`<label>${s.label}</label><output></output><input type="range" min="${s.min}" max="${s.max}" step="${s.step}">`);
+  const lo = s.log ? 0 : s.min, hi = s.log ? 1 : s.max, st = s.log ? 0.001 : s.step;
+  const row = addRow(`<label>${s.label}</label><output></output><input type="range" min="${lo}" max="${hi}" step="${st}">`
+    + (s.hint ? `<small style="grid-column:1/-1;color:#fff8;margin-top:-2px">${s.hint}</small>` : ''));
+  row.dataset.modes = (s.modes || ['dye', 'water']).join(' '); rows.push(row);
   const inp = row.querySelector('input'), out = row.querySelector('output');
-  const show = () => { inp.value = cfg[s.k]; out.textContent = +(+cfg[s.k]).toFixed(2); };
-  inp.oninput = () => { cfg[s.k] = +inp.value; out.textContent = +(+inp.value).toFixed(2); if (!s.apply) save(); };
+  const fmt = v => s.log ? (v >= 100 ? Math.round(v) : +v.toPrecision(2)) + '×' : +(+v).toFixed(2);
+  const toVal = t => s.log ? Math.round(s.min * Math.pow(s.max / s.min, t) * 10) / 10 : t;
+  const show = () => { inp.value = s.log ? Math.log(cfg[s.k] / s.min) / Math.log(s.max / s.min) : cfg[s.k]; out.textContent = fmt(+cfg[s.k]); };
+  inp.oninput = () => { cfg[s.k] = toVal(+inp.value); out.textContent = fmt(cfg[s.k]); if (!s.apply) save(); };
   if (s.apply) inp.onchange = () => { s.apply(); save(); };
   widgets[s.k] = show; show();
+}
+{
+  const dRow = rows[SCHEMA.findIndex(x => x.k === 'density')];
+  const box = document.createElement('div'); box.className = 'row'; box.dataset.modes = 'water'; box.style.cssText = 'display:flex;gap:8px;flex-wrap:wrap';
+  for (const [label, v] of [['Real water (800×)', 800], ['Balanced (100×)', 100], ['Light & fast (16×)', 16]]) {
+    const b = document.createElement('button'); b.textContent = label;
+    b.onclick = () => { cfg.density = v; widgets.density(); save(); };
+    box.appendChild(b);
+  }
+  dRow.after(box); rows.push(box);
+}
+function applyModeVisibility() {      // only show the settings that matter for the current mode
+  for (const r of rows) r.style.display = r.dataset.modes.split(' ').includes(cfg.mode) ? (r.dataset.modes === 'water' && r.style.cssText.includes('flex') ? 'flex' : '') : 'none';
+  $('swirl').style.display = cfg.mode === 'dye' ? '' : 'none';
 }
 {
   const r = addRow(`<label>Resolution level</label><output></output><input type="range" min="0" max="${LEVELS.length - 1}" step="1">`);
