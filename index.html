@@ -328,19 +328,30 @@ const FRAG = {
       o = vec4(bx, by, 0.0, 1.0);
     }`,
 
-  projectU: HEAD + `uniform sampler2D uU, uP, uB;
+  // Pressure update of the face velocities. Air is ~800x lighter than water, so tiny pressure errors in
+  // the air become large air velocities; slow-moving faces that touch no water are therefore damped away
+  // (fast ones, e.g. the air around a falling ball, are left alone).
+  projectU: HEAD + `uniform sampler2D uU, uP, uB, uPhi; uniform float airCap;
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uP, 0);
       if (c.x <= 0 || c.x >= n.x) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
       float b = texelFetch(uB, c - ivec2(1, 0), 0).x;
-      o = vec4(texelFetch(uU, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(1, 0), 0).x), 0.0, 0.0, 1.0);
+      float u = texelFetch(uU, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(1, 0), 0).x);
+      float w = 0.5 * (texelFetch(uPhi, c, 0).x + texelFetch(uPhi, c - ivec2(1, 0), 0).x);
+      float air = 1.0 - smoothstep(0.02, 0.3, w);
+      u = mix(u, clamp(u, -airCap, airCap), air);                       // light air can't go faster than a few screen heights per second
+      o = vec4(u * max(1.0 - air, smoothstep(30.0, 150.0, abs(u))), 0.0, 0.0, 1.0);
     }`,
-  projectV: HEAD + `uniform sampler2D uV, uP, uB;
+  projectV: HEAD + `uniform sampler2D uV, uP, uB, uPhi; uniform float airCap;
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uP, 0);
       if (c.y <= 0 || c.y >= n.y) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
       float b = texelFetch(uB, c - ivec2(0, 1), 0).y;
-      o = vec4(texelFetch(uV, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(0, 1), 0).x), 0.0, 0.0, 1.0);
+      float v = texelFetch(uV, c, 0).x - b * (texelFetch(uP, c, 0).x - texelFetch(uP, c - ivec2(0, 1), 0).x);
+      float w = 0.5 * (texelFetch(uPhi, c, 0).x + texelFetch(uPhi, c - ivec2(0, 1), 0).x);
+      float air = 1.0 - smoothstep(0.02, 0.3, w);
+      v = mix(v, clamp(v, -airCap, airCap), air);
+      o = vec4(v * max(1.0 - air, smoothstep(30.0, 150.0, abs(v))), 0.0, 0.0, 1.0);
     }`,
 
   // Semi-Lagrangian advection (midpoint backtrace) of the face velocities by themselves.
@@ -636,8 +647,8 @@ class Flip {
   constructor(nx, ny) {
     this.nx = nx; this.ny = ny; this.fX = nx + 2; this.fY = ny + 2;     // +1 solid wall cell all around
     const N = this.N = this.fX * this.fY, fX = this.fX, fY = this.fY;
-    for (const k of ['u', 'v', 'du', 'dv', 'pu', 'pv', 's', 'dens']) this[k] = new Float32Array(N);
-    this.type = new Uint8Array(N); this.rest = 0; this.k = 8; this.push = 2;   // k: strength of the volume-drift correction
+    for (const k of ['u', 'v', 'du', 'dv', 'pu', 'pv', 's', 'dens', 'P']) this[k] = new Float32Array(N);
+    this.type = new Uint8Array(N); this.rest = 0; this.lastDt = 0; this.band = 0; this.smooth = true; this.k = 1; this.push = 2;   // k: strength of the volume-drift correction
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
     this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
@@ -741,30 +752,62 @@ class Flip {
       const sx = 1 - tx, sy = 1 - ty;
       dens[x0 * n + y0] += sx * sy; dens[x1 * n + y0] += tx * sy; dens[x1 * n + y1] += tx * ty; dens[x0 * n + y1] += sx * ty;
     }
+    if (this.smooth) {            // remove the lattice-scale ripple so only real compression is corrected
+      const t = this.tmp || (this.tmp = new Float32Array(this.N));
+      for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+        const c = i * n + j;
+        t[c] = (dens[c] * 4 + dens[c - n] + dens[c + n] + dens[c - 1] + dens[c + 1]) / 8;
+      }
+      for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) dens[i * n + j] = t[i * n + j];
+    }
     if (this.rest === 0) {
       let sum = 0, cnt = 0;
       for (let i = 0; i < this.N; i++) if (type[i] === F_FLUID) { sum += dens[i]; cnt++; }
       if (cnt > 0) this.rest = sum / cnt;
     }
   }
-  solve(iters) {
-    const { fX, fY, u, v, s, type, dens } = this, n = fY, over = 1.9, rest = this.rest;
-    this.pu.set(u); this.pv.set(v);
+  solve(iters, dt) {
+    const { fX, fY, u, v, s, type, dens, P } = this, n = fY, over = 1.9, rest = this.rest;
+    // Warm start: the previous pressure (mostly the weight of the water above) is applied first, so the
+    // iterations only have to fix what changed. Without it, gravity (a big impulse every step) is only
+    // partly cancelled and the water never quite comes to rest.
+    const ws = this.lastDt > 0 ? dt / this.lastDt : 0; this.lastDt = dt;
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j;
+      if (type[c] !== F_FLUID) { P[c] = 0; continue; }
+      const p = P[c] * ws; P[c] = p;
+      u[c] -= s[c - n] * p; u[c + n] += s[c + n] * p; v[c] -= s[c - 1] * p; v[c + 1] += s[c + 1] * p;
+    }
     for (let it = 0; it < iters; it++) for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
       const c = i * n + j; if (type[c] !== F_FLUID) continue;
       const l = c - n, r = c + n, b = c - 1, t = c + 1;
       const sx0 = s[l], sx1 = s[r], sy0 = s[b], sy1 = s[t], sum = sx0 + sx1 + sy0 + sy1; if (sum === 0) continue;
       let div = u[r] - u[c] + v[t] - v[c];
-      if (rest > 0) { const comp = dens[c] - rest; if (comp > 0) div -= this.k * comp; }     // push apart over-packed regions
+      if (rest > 0) { const comp = dens[c] - rest * (1 + this.band); if (comp > 0) div -= this.k * comp; }     // push apart over-packed regions
       const p = -div / sum * over;
-      u[c] -= sx0 * p; u[r] += sx1 * p; v[c] -= sy0 * p; v[t] += sy1 * p;
+      u[c] -= sx0 * p; u[r] += sx1 * p; v[c] -= sy0 * p; v[t] += sy1 * p; P[c] += p;
+    }
+  }
+  // Gravity is added to the *grid* velocity, the pressure solve then cancels what the water below holds
+  // up, and only afterwards are the particles moved with the corrected velocity. (Moving them by the raw
+  // gravity-augmented velocity first makes resting water sag by g*dt^2 every step and then fight back.)
+  addGravity(dt, gx, gy) {
+    const { fX, fY, u, v, type } = this, n = fY;
+    for (let i = 1; i < fX - 1; i++) for (let j = 1; j < fY - 1; j++) {
+      const c = i * n + j; if (type[c] !== F_FLUID) continue;
+      if (type[c - n] !== F_SOLID) u[c] += gx * dt;
+      if (type[c + n] !== F_SOLID && type[c + n] !== F_FLUID) u[c + n] += gx * dt;
+      if (type[c - 1] !== F_SOLID) v[c] += gy * dt;
+      if (type[c + 1] !== F_SOLID && type[c + 1] !== F_FLUID) v[c + 1] += gy * dt;
     }
   }
   substep(dt, gx, gy, ratio, iters) {
     const { np, pos, vel } = this, minX = 1 + this.r, maxX = this.fX - 1 - this.r, minY = 1 + this.r, maxY = this.fY - 1 - this.r;
-    for (let i = 0; i < np; i++) {
-      vel[2 * i] += gx * dt; vel[2 * i + 1] += gy * dt; pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
-    }
+    this.transfer(true, 0);
+    this.pu.set(this.u); this.pv.set(this.v);          // snapshot before forces: FLIP copies (after - before) back to the particles
+    this.addGravity(dt, gx, gy);
+    this.updateDensity(); this.solve(iters, dt); this.transfer(false, ratio);
+    for (let i = 0; i < np; i++) { pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt; }
     this.pushApart(this.push);
     for (let i = 0; i < np; i++) {
       let x = pos[2 * i], y = pos[2 * i + 1];
@@ -772,7 +815,6 @@ class Flip {
       if (y < minY) { y = minY; vel[2 * i + 1] = 0; } if (y > maxY) { y = maxY; vel[2 * i + 1] = 0; }
       pos[2 * i] = x; pos[2 * i + 1] = y;
     }
-    this.transfer(true, 0); this.updateDensity(); this.solve(iters); this.transfer(false, ratio);
   }
   step(dt, gx, gy, ratio, iters) {
     let vmax = 0; for (let i = 0; i < this.np; i++) { const a = this.vel[2 * i], b = this.vel[2 * i + 1]; vmax = Math.max(vmax, a * a + b * b); }
@@ -932,8 +974,8 @@ function stepWater(dt) {
   // heavier water (bigger density jump between water and air) needs more V-cycles to settle hydrostatic pressure
   const cycles = cfg.density > 200 ? 4 : cfg.density > 40 ? 3 : 2;
   for (let i = 0; i < cycles; i++) wvcycle(0, 3, 3);
-  texUnit = 0; u = use(P.projectU); bindTex(u.uU, WS.U.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); blit(WS.U.write);
-  texUnit = 0; u = use(P.projectV); bindTex(u.uV, WS.V.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); blit(WS.V.write);
+  texUnit = 0; u = use(P.projectU); bindTex(u.uU, WS.U.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.airCap, 3 * H); blit(WS.U.write);
+  texUnit = 0; u = use(P.projectV); bindTex(u.uV, WS.V.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.airCap, 3 * H); blit(WS.V.write);
   WS.U.swap(); WS.V.swap();
 
   // move the water with the new velocity
