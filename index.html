@@ -31,6 +31,12 @@
   #panel .row.check { grid-template-columns: auto 1fr; align-items: center; }
   #panel button { font: inherit; color: #fffc; background: #ffffff1f; border: 1px solid #ffffff2e; border-radius: 999px; padding: 9px 14px; }
   #hud { z-index: 2; }
+  #scenes { position: fixed; left: calc(12px + env(safe-area-inset-left)); bottom: calc(110px + env(safe-area-inset-bottom)); display: none;
+    flex-direction: column; gap: 6px; padding: 10px; z-index: 3; border-radius: 14px; background: #000000b0;
+    backdrop-filter: blur(12px); -webkit-backdrop-filter: blur(12px); border: 1px solid #ffffff22; font: 13px/1.2 system-ui, sans-serif; }
+  #scenes.open { display: flex; }
+  #scenes button { font: inherit; text-align: left; color: #fffd; background: #ffffff14; border: 1px solid #ffffff22; border-radius: 10px; padding: 10px 14px; }
+  #scenes button small { display: block; color: #fff8; font-size: 11px; margin-top: 3px; }
   #msg { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
     color: #fff; font: 16px/1.4 system-ui, sans-serif; text-align: center; white-space: pre-wrap; }
 </style>
@@ -39,10 +45,15 @@
 <canvas id="c"></canvas>
 <div id="hud">
   <button id="clear">Reset</button>
+  <button id="sceneBtn">Scene: Tank</button>
+  <button id="tool">Tool: Water</button>
+  <button id="paddle">Wave maker: off</button>
+  <button id="tap">Tap: off</button>
   <button id="motion" hidden>Tilt: off</button>
   <button id="gear">Settings</button>
   <div id="stats"></div>
 </div>
+<div id="scenes"></div>
 <div id="panel"></div>
 <div id="msg"></div>
 <script>
@@ -93,10 +104,22 @@ const cfg = {
   flipIters: 40,      // FLIP: pressure solver sweeps per step (APIC Pro: maximum conjugate-gradient iterations)
   density: 100,       // water mode: water density relative to air (real water ≈ 800; 100 stays calmer)
   tiltStrength: 1,    // multiplier for device-tilt gravity
+  paddleAmp: 0.015,   // wave maker: half the stroke of the piston, in screen heights
+  paddlePeriod: 0.3,  // wave maker: seconds per stroke cycle
+  tapSpeed: 1.0,      // tap: outflow speed, screen heights per second
+  jetSpeed: 2.5,      // fountain pump: jet speed, screen heights per second
+  wallSize: 0.016,    // radius of the wall brush, screen heights
   maxDpr: 1.5,
 };
 
 const isParticles = () => cfg.waterAlgo !== 'grid';
+// Obstacles / scene state (shared by every solver). SOL.mat holds a material per mask texel:
+// 0 empty, 1 drawn wall (concrete), 2 sand, 3 rock, 4 glass, 5 metal.
+const SOL = { w: 0, h: 0, mat: null, tex: null, dirty: true };
+const PADDLE = { on: false, t: 0 };                     // piston wave maker on the left wall
+const TAP = { on: false, halfWidth: 0.012, y0: 0.9, y1: 0.96 };   // nozzle near the top centre (uv y range)
+const scene = { name: 'tank', jet: null };              // jet: fountain pump region (uv box) or null
+let tool = 'water';                                     // 'water' (stir / hold for a ball), 'wall', 'erase'
 
 // ----- shaders -------------------------------------------------------------
 const VERT = `#version 300 es
@@ -161,8 +184,22 @@ const FRAG = {
     void main(){ o = vec4(clamp(vUv.y - level, -band, band), 0.0, 0.0, 1.0); }`,
   stampLS: HEAD + `uniform sampler2D uTex; uniform vec2 point; uniform float aspect, radius;
     void main(){ vec2 d = vUv - point; d.x *= aspect; o = vec4(min(texture(uTex, vUv).x, length(d) - radius), 0.0, 0.0, 1.0); }`,
-  lsToFill: HEAD + `uniform sampler2D uTex; uniform float eps;
-    void main(){ o = vec4(1.0 - smoothstep(-eps, eps, texture(uTex, vUv).x), 0.0, 0.0, 1.0); }`,
+  // fill fraction for drawing / volume; water hidden inside solids doesn't count, so drawing a wall into the pool
+  // displaces the water (the volume controller then lifts the surface by exactly that much)
+  lsToFill: HEAD + `uniform sampler2D uTex, uMask; uniform float eps, paddleUV;
+    void main(){
+      float f = 1.0 - smoothstep(-eps, eps, texture(uTex, vUv).x);
+      float sol = vUv.x < paddleUV ? 1.0 : smoothstep(0.3, 0.7, texture(uMask, vUv).x);
+      o = vec4(f * (1.0 - sol), 0.0, 0.0, 1.0);
+    }`,
+  // the tap: a box of water at the nozzle
+  stampBoxLS: HEAD + `uniform sampler2D uTex; uniform vec4 box; uniform float aspect;
+    void main(){
+      vec2 p = vec2(vUv.x * aspect, vUv.y), lo = vec2(box.x * aspect, box.y), hi = vec2(box.z * aspect, box.w);
+      vec2 q = abs(p - 0.5 * (lo + hi)) - 0.5 * (hi - lo);
+      float sd = length(max(q, 0.0)) + min(max(q.x, q.y), 0.0);
+      o = vec4(min(texture(uTex, vUv).x, sd), 0.0, 0.0, 1.0);
+    }`,
   // fill fraction per simulation cell (for the densities), with the surface smoothed over about two cells
   phiDown: HEAD + `uniform sampler2D uPsi; uniform vec2 cell; uniform float eps;
     void main(){
@@ -204,13 +241,15 @@ const FRAG = {
     }`,
 
   // Face coefficients beta = 1/density between neighbouring cells (0 at solid walls).
-  beta: HEAD + `uniform sampler2D uPhi; uniform float rhoA;     // water density = 1, air density = rhoA (= 1 / ratio)
+  beta: HEAD + `uniform sampler2D uPhi, uSolid; uniform float rhoA, paddleX;     // water density = 1, air density = rhoA (= 1 / ratio)
     float rho(ivec2 c){ return mix(rhoA, 1.0, clamp(texelFetch(uPhi, c, 0).x, 0.0, 1.0)); }
+    bool solid(ivec2 c){ return texelFetch(uSolid, c, 0).x > 0.5 || float(c.x) + 0.5 < paddleX; }
     void main(){
       ivec2 c = ivec2(gl_FragCoord.xy), n = textureSize(uPhi, 0);
+      if (solid(c)) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }      // obstacles take no part in the pressure solve
       float r = rho(c);
-      float bx = c.x < n.x - 1 ? 2.0 / (r + rho(c + ivec2(1, 0))) : 0.0;
-      float by = c.y < n.y - 1 ? 2.0 / (r + rho(c + ivec2(0, 1))) : 0.0;
+      float bx = (c.x < n.x - 1 && !solid(c + ivec2(1, 0))) ? 2.0 / (r + rho(c + ivec2(1, 0))) : 0.0;
+      float by = (c.y < n.y - 1 && !solid(c + ivec2(0, 1))) ? 2.0 / (r + rho(c + ivec2(0, 1))) : 0.0;
       o = vec4(bx, by, 0.0, 1.0);
     }`,
 
@@ -230,6 +269,7 @@ const FRAG = {
       float bL = c.x > 0 ? texelFetch(uB, c - ivec2(1, 0), 0).x : 0.0;
       float bB = c.y > 0 ? texelFetch(uB, c - ivec2(0, 1), 0).y : 0.0;
       float sum = b.x + bL + b.y + bB, s = 0.0;
+      if (sum <= 0.0) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }     // a cell walled in on all sides (inside an obstacle)
       if (b.x > 0.0) s += b.x * texelFetch(uP, c + ivec2(1, 0), 0).x;
       if (bL > 0.0)  s += bL  * texelFetch(uP, c - ivec2(1, 0), 0).x;
       if (b.y > 0.0) s += b.y * texelFetch(uP, c + ivec2(0, 1), 0).x;
@@ -246,6 +286,7 @@ const FRAG = {
       float bL = c.x > 0 ? texelFetch(uB, c - ivec2(1, 0), 0).x : 0.0;
       float bB = c.y > 0 ? texelFetch(uB, c - ivec2(0, 1), 0).y : 0.0;
       float f = 0.0;
+      if (b.x + bL + b.y + bB <= 0.0) { o = vec4(0.0, 0.0, 0.0, 1.0); return; }
       if (b.x > 0.0) f += b.x * (texelFetch(uP, c + ivec2(1, 0), 0).x - p);
       if (bL > 0.0)  f += bL  * (texelFetch(uP, c - ivec2(1, 0), 0).x - p);
       if (b.y > 0.0) f += b.y * (texelFetch(uP, c + ivec2(0, 1), 0).x - p);
@@ -320,6 +361,32 @@ const FRAG = {
       o = vec4(wall ? 0.0 : texelFetch(uTex, c, 0).x + acc, 0.0, 0.0, 1.0);
     }`,
 
+  // Faces touching an obstacle carry the obstacle's velocity: 0, or the wave maker's for faces on/behind its plate.
+  solidFaces: HEAD + `uniform sampler2D uTex, uSolid; uniform float kind, paddleX, paddleU;
+    bool solid(ivec2 c){ ivec2 n = textureSize(uSolid, 0);
+      return c.x < 0 || c.y < 0 || c.x >= n.x || c.y >= n.y || texelFetch(uSolid, c, 0).x > 0.5; }
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      float v = texelFetch(uTex, c, 0).x;
+      if (kind < 0.5) {                                   // u face between cells (x-1, y) and (x, y)
+        if (float(c.x) < paddleX + 0.5) v = paddleU;
+        else if (solid(c - ivec2(1, 0)) || solid(c)) v = 0.0;
+      } else {                                            // v face between cells (x, y-1) and (x, y)
+        if (float(c.x) + 0.5 < paddleX || solid(c - ivec2(0, 1)) || solid(c)) v = 0.0;
+      }
+      o = vec4(v, 0.0, 0.0, 1.0);
+    }`,
+  // a pump / tap: inside the box the flow is driven vertically at the given speed
+  jetFaces: HEAD + `uniform sampler2D uTex; uniform vec2 gridSize; uniform vec4 box; uniform float kind, vel;
+    void main(){
+      ivec2 c = ivec2(gl_FragCoord.xy);
+      vec2 pos = kind < 0.5 ? vec2(float(c.x) / gridSize.x, (float(c.y) + 0.5) / gridSize.y)
+                            : vec2((float(c.x) + 0.5) / gridSize.x, float(c.y) / gridSize.y);
+      float v = texelFetch(uTex, c, 0).x;
+      if (pos.x > box.x && pos.x < box.z && pos.y > box.y && pos.y < box.w) v = kind < 0.5 ? 0.0 : vel;
+      o = vec4(v, 0.0, 0.0, 1.0);
+    }`,
+
   // Gaussian push (amount > 0 adds velocity) or, with radius mode, a solid ball that zeroes motion.
   splatFaces: HEAD + `uniform sampler2D uTex; uniform vec2 gridSize, point; uniform float aspect, radius, kind, amount, stamp;
     void main(){
@@ -342,7 +409,7 @@ const FRAG = {
       o = textureLod(uSource, p0 / gridSize, 0.0);
     }`,
 
-  displayWater: HEAD + VELSRC + `uniform sampler2D uWater; uniform vec2 gdir; uniform float aspect, time, velScale; uniform vec3 balls[4];
+  displayWater: HEAD + VELSRC + `uniform sampler2D uWater, uMask; uniform vec2 gdir; uniform float aspect, time, velScale, paddleUV; uniform vec3 balls[4];
     float W(vec2 uv){ return textureLod(uWater, uv, 0.0).x; }
     float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
     float noise(vec2 p){
@@ -394,6 +461,46 @@ const FRAG = {
       water = mix(water, vec3(0.9, 0.96, 1.0), clamp(foam, 0.0, 0.85));
 
       vec3 c = mix(backdrop(vUv), water, m);
+
+      // ---- solids: walls you drew, sand, rocks, glass, metal, and the wave maker's plate
+      vec2 mts = vec2(textureSize(uMask, 0));
+      float cov = vUv.x < paddleUV ? 1.0 : texture(uMask, vUv).x;
+      if (cov > 0.02) {
+        vec2 q = vec2(vUv.x * aspect, vUv.y);
+        ivec2 mi = clamp(ivec2(vUv * mts), ivec2(0), ivec2(mts) - 1);
+        float mat = floor(texelFetch(uMask, mi, 0).y * 255.0 / 40.0 + 0.5);
+        vec2 e = 1.5 / mts;
+        vec2 sg = vec2(texture(uMask, vUv + vec2(e.x, 0.0)).x - texture(uMask, vUv - vec2(e.x, 0.0)).x,
+                       texture(uMask, vUv + vec2(0.0, e.y)).x - texture(uMask, vUv - vec2(0.0, e.y)).x);
+        float rim = clamp(dot(-sg, normalize(vec2(-0.6, 0.8))), -1.0, 1.0);     // bevel, lit from the upper left
+        float alpha = smoothstep(0.35, 0.65, cov);
+        vec3 sc;
+        bool seeThrough = false;
+        if (vUv.x < paddleUV) {                                         // wave maker: yellow plate, dark drive behind it
+          float dEdge = (paddleUV - vUv.x) * aspect;
+          sc = dEdge < 0.012 ? vec3(0.95, 0.68, 0.18) * (0.75 + 0.3 * smoothstep(0.012, 0.0, dEdge))
+                             : vec3(0.16, 0.18, 0.21) + 0.05 * step(0.5, fract(q.y * 14.0));
+          alpha = 1.0; rim = 0.0;
+        } else if (mat > 1.5 && mat < 2.5) {                             // sand
+          sc = vec3(0.78, 0.67, 0.47) * (0.78 + 0.35 * noise(q * 420.0)) * (0.9 + 0.15 * noise(q * 30.0));
+        } else if (mat > 2.5 && mat < 3.5) {                             // rock
+          float n1 = noise(q * 16.0), n2 = noise(q * 70.0);
+          sc = mix(vec3(0.27, 0.26, 0.25), vec3(0.50, 0.47, 0.42), n1) * (0.72 + 0.4 * n2);
+        } else if (mat > 3.5 && mat < 4.5) {                             // glass: mostly see-through, bright edges
+          sc = c * vec3(0.9, 0.96, 1.0) + vec3(0.05, 0.07, 0.09) + vec3(0.65, 0.85, 0.95) * abs(rim) * 0.9;
+          rim = 0.0; seeThrough = true;
+        } else if (mat > 4.5) {                                         // metal pipe
+          sc = vec3(0.55, 0.58, 0.62) * (0.75 + 0.3 * noise(q * vec2(6.0, 260.0)));
+        } else {                                                        // concrete wall (drawn by you)
+          sc = vec3(0.47, 0.47, 0.48) * (0.84 + 0.2 * noise(q * 140.0)) * (0.92 + 0.12 * noise(q * 18.0));
+        }
+        sc *= 1.0 + 0.6 * rim;
+        if (!seeThrough) {                                              // seen through the water in front of it
+          vec3 Tw = exp(-vec3(5.0, 1.6, 0.9) * depth * 0.7);
+          sc = sc * Tw + scatter * (1.0 - Tw);
+        }
+        c = mix(c, sc, alpha);
+      }
       for (int i = 0; i < 4; i++) {                                     // growing water balls being held down
         if (balls[i].z <= 0.0) continue;
         vec2 d = vUv - balls[i].xy; d.x *= aspect;
@@ -518,11 +625,21 @@ function initBuffers() {
 // slides as one mass and air simply gets out of the way. A multigrid V-cycle with the same
 // variable coefficients handles the long-range (hydrostatic) pressure cheaply.
 const WS = {};
+function byteTex(w, h, fmt, layout, filter, data = null) {
+  const tex = gl.createTexture(); gl.bindTexture(gl.TEXTURE_2D, tex);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, filter); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, filter);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE); gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texImage2D(gl.TEXTURE_2D, 0, fmt, w, h, 0, layout, gl.UNSIGNED_BYTE, data);
+  return { tex, w, h };
+}
 function buildWater(w, h) {
   if (WS.U) { WS.U.destroy(); WS.V.destroy(); WS.phi.destroy(); WS.lv.forEach(l => { l.p.destroy(); l.d.destroy(); l.b.destroy(); l.r.destroy(); }); }
   WS.grid = [w, h];
   WS.U = makeDouble(w + 1, h, gl.LINEAR); WS.V = makeDouble(w, h + 1, gl.LINEAR);
   WS.phi = makeFBO(w, h, gl.LINEAR);
+  if (WS.solid) gl.deleteTexture(WS.solid.tex);
+  WS.solid = byteTex(w, h, gl.R8, gl.RED, gl.NEAREST); SOL.dirty = true;   // which simulation cells are inside obstacles
   WS.lv = [];
   for (;;) {
     // pressure scales with density x gravity x depth (thousands), far beyond half-float precision -> 32-bit
@@ -564,7 +681,11 @@ const FILL_LEVEL = 0.4;        // fraction of the tank filled at start (matches 
 let waterTarget = FILL_LEVEL;  // the water volume the solver keeps constant (re-measured when you drop a ball)
 const LS_BAND = 0.06;           // psi is clamped to +-this many screen heights (only the region near the surface matters)
 function lsRefresh() {         // psi -> fill fraction (for drawing and for measuring the volume)
-  texUnit = 0; const u = use(P.lsToFill); bindTex(u.uTex, lset.read); gl.uniform1f(u.eps, 1.5 / lset.read.h); blit(water.write); water.swap();
+  ensureMask();
+  const pd = paddleNow();
+  texUnit = 0; const u = use(P.lsToFill); bindTex(u.uTex, lset.read); bindTex(u.uMask, SOL.tex);
+  gl.uniform1f(u.eps, 1.5 / lset.read.h); gl.uniform1f(u.paddleUV, pd ? pd.x / (canvas.width / canvas.height) : -1);
+  blit(water.write); water.swap();
   texUnit = 0; use(P.massDown); bindTex(P.massDown.u.uTex, water.read); blit(massTex);
   gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
 }
@@ -590,6 +711,9 @@ class Flip {
     // sleep: speeds below this (cells/s; 0.05 screen heights/s) are damped so resting water goes completely still
     // without also killing gentle waves; k: strength of the volume-drift correction
     for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) this.s[i * fY + j] = (i === 0 || i === fX - 1 || j === 0 || j === fY - 1) ? 0 : 1;
+    // obstacles: base = solid flags without the moving wave maker; sdf = distance to the nearest obstacle (cells)
+    this.base = Float32Array.from(this.s); this.obst = new Uint8Array(N); this.sdf = new Float32Array(N); this.hasObst = false;
+    this.paddleX = -1; this.paddleU = 0; this._padWas = false; this.jet = null;
     this.r = 0.3; this.invSp = 1 / (2.2 * this.r);
     this.hx = Math.floor(fX * this.invSp) + 1; this.hy = Math.floor(fY * this.invSp) + 1;
     this.hCount = new Int32Array(this.hx * this.hy); this.hFirst = new Int32Array(this.hx * this.hy + 1);
@@ -606,8 +730,61 @@ class Flip {
     for (let y = y0; y < y1; y += dy, row++)
       for (let x = x0 + (row & 1 ? this.r : 0); x < x1; x += dx) if (!inside || inside(x, y)) this.add(x, y);
   }
-  fill(level) { this.np = 0; this.rest = 0; this.u.fill(0); this.v.fill(0);
-    this.pack(1 + this.r, 1 + this.r, this.fX - 1 - this.r, 1 + level * this.ny); }
+  fill(level) { this.fillFn((u, v) => v - level); }
+  // fill every free spot where water(u, v) < 0 (u, v in 0..1 across the tank) with particles at rest
+  fillFn(water) {
+    this.np = 0; this.rest = 0; this.u.fill(0); this.v.fill(0); this.P.fill(0);
+    this.pack(1 + this.r, 1 + this.r, this.fX - 1 - this.r, this.fY - 1 - this.r,
+      (x, y) => water((x - 1) / this.nx, (y - 1) / this.ny) < 0 && this.free(x, y));
+  }
+  free(x, y) { return (!this.hasObst || this.sdfAt(x, y) > this.r) && !(this.paddleX >= 0 && x < this.paddleX + this.r); }
+  setObstacles(fn) {                               // fn(u, v) -> true where a scene / drawn obstacle is
+    const { fX, fY, nx, ny, obst, base } = this, n = fY; let any = false;
+    for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
+      const c = i * n + j, border = i === 0 || i === fX - 1 || j === 0 || j === fY - 1;
+      obst[c] = !border && fn((i - 0.5) / nx, (j - 0.5) / ny) ? 1 : 0;
+      if (obst[c]) any = true;
+      base[c] = border || obst[c] ? 0 : 1;
+    }
+    this.s.set(base); this._padWas = true; this.hasObst = any;
+    if (any) this.computeSDF();
+  }
+  computeSDF() {                                   // two-pass chamfer distance transform, inside and outside the obstacles
+    const { fX, fY, obst, N } = this, n = fY, INF = 1e6, D = Math.SQRT2;
+    const dOut = new Float32Array(N), dIn = new Float32Array(N);
+    for (let c = 0; c < N; c++) { dOut[c] = obst[c] ? 0 : INF; dIn[c] = obst[c] ? INF : 0; }
+    for (const d of [dOut, dIn]) {
+      for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
+        const c = i * n + j; let v = d[c];
+        if (i > 0) { v = Math.min(v, d[c - n] + 1); if (j > 0) v = Math.min(v, d[c - n - 1] + D); if (j < fY - 1) v = Math.min(v, d[c - n + 1] + D); }
+        if (j > 0) v = Math.min(v, d[c - 1] + 1);
+        d[c] = v;
+      }
+      for (let i = fX - 1; i >= 0; i--) for (let j = fY - 1; j >= 0; j--) {
+        const c = i * n + j; let v = d[c];
+        if (i < fX - 1) { v = Math.min(v, d[c + n] + 1); if (j < fY - 1) v = Math.min(v, d[c + n + 1] + D); if (j > 0) v = Math.min(v, d[c + n - 1] + D); }
+        if (j < fY - 1) v = Math.min(v, d[c + 1] + 1);
+        d[c] = v;
+      }
+    }
+    for (let c = 0; c < N; c++) this.sdf[c] = obst[c] ? -(dIn[c] - 0.5) : dOut[c] - 0.5;
+  }
+  sdfAt(x, y) {
+    const { fX, fY, sdf } = this, n = fY;
+    const gx = Math.min(Math.max(x - 0.5, 0), fX - 1.001), gy = Math.min(Math.max(y - 0.5, 0), fY - 1.001);
+    const i = Math.floor(gx), j = Math.floor(gy), tx = gx - i, ty = gy - j, c = i * n + j;
+    return (sdf[c] * (1 - tx) + sdf[c + n] * tx) * (1 - ty) + (sdf[c + 1] * (1 - tx) + sdf[c + n + 1] * tx) * ty;
+  }
+  applyJet() {                                     // fountain pump: drive the faces inside the pump box upward
+    const j = this.jet; if (!j) return;
+    const { fY, u, v } = this, n = fY;
+    for (let i = Math.max(1, Math.floor(j.x0)); i <= Math.min(this.fX - 2, Math.ceil(j.x1)); i++)
+      for (let k = Math.max(1, Math.floor(j.y0)); k <= Math.min(this.fY - 2, Math.ceil(j.y1)); k++) {
+        const c = i * n + k;
+        if (i + 0.5 > j.x0 && i + 0.5 < j.x1 && k > j.y0 && k < j.y1) v[c] = j.v;
+        if (i > j.x0 && i < j.x1 && k + 0.5 > j.y0 && k + 0.5 < j.y1) u[c] = 0;
+      }
+  }
   pushApart(iters) {
     const { hx, hy, hCount, hFirst, ids, pos, np, invSp } = this, minD = 2 * this.r, minD2 = minD * minD;
     hCount.fill(0);
@@ -677,8 +854,8 @@ class Flip {
         for (let i = 0; i < f.length; i++) if (d[i] > 0) f[i] /= d[i];
         for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {
           const c = i * n + j, solid = type[c] === F_SOLID;
-          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = this.pu[c];
-          if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = this.pv[c];
+          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = i < this.paddleX + 0.5 ? this.paddleU : 0;   // walls move with the wave maker or stay put
+          if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = 0;
         }
       }
     }
@@ -745,7 +922,7 @@ class Flip {
     const { np, pos, vel } = this;
     this.transfer(true, 0);
     this.pu.set(this.u); this.pv.set(this.v);          // snapshot before forces: FLIP copies (after - before) back to the particles
-    this.addGravity(dt, gx, gy);
+    this.addGravity(dt, gx, gy); this.applyJet();
     this.updateDensity(); this.solve(iters, dt); this.transfer(false, ratio);
     for (let i = 0; i < np; i++) {
       // let nearly-still water go fully still (kills the low-level FLIP jitter) without touching real motion
@@ -753,7 +930,8 @@ class Flip {
       if (sp < this.sleep) { const t = Math.max(0, (sp - this.sleep * 0.2) / (this.sleep * 0.8)); f = 0.3 + 0.7 * t * t * (3 - 2 * t); vel[2 * i] *= f; vel[2 * i + 1] *= f; }
       pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
     }
-    if (!this.pushOnce) { this.pushApart(this.push); this.walls(); }
+    if (!this.pushOnce) this.pushApart(this.push);
+    this.walls();
   }
   walls() {
     const { np, pos, vel } = this, minX = 1 + this.r, maxX = this.fX - 1 - this.r, minY = 1 + this.r, maxY = this.fY - 1 - this.r;
@@ -763,8 +941,23 @@ class Flip {
       if (y < minY) { y = minY; vel[2 * i + 1] = 0; } if (y > maxY) { y = maxY; vel[2 * i + 1] = 0; }
       pos[2 * i] = x; pos[2 * i + 1] = y;
     }
+    const r = this.r, px = this.paddleX;
+    if (px >= 0) for (let i = 0; i < np; i++) if (pos[2 * i] < px + r) { pos[2 * i] = px + r; if (vel[2 * i] < this.paddleU) vel[2 * i] = this.paddleU; }
+    if (this.hasObst) for (let i = 0; i < np; i++) {   // push particles out of obstacles along the distance gradient
+      const x = pos[2 * i], y = pos[2 * i + 1], d = this.sdfAt(x, y);
+      if (d >= r) continue;
+      let gx = this.sdfAt(x + 0.5, y) - this.sdfAt(x - 0.5, y), gy = this.sdfAt(x, y + 0.5) - this.sdfAt(x, y - 0.5);
+      const gm = Math.hypot(gx, gy) || 1; gx /= gm; gy /= gm;
+      pos[2 * i] = x + gx * (r - d); pos[2 * i + 1] = y + gy * (r - d);
+      const vn = vel[2 * i] * gx + vel[2 * i + 1] * gy; if (vn < 0) { vel[2 * i] -= vn * gx; vel[2 * i + 1] -= vn * gy; }
+    }
   }
   step(dt, gx, gy, ratio, iters) {
+    if (this.paddleX >= 0 || this._padWas) {       // cells behind the wave maker's plate are solid this step
+      this.s.set(this.base);
+      if (this.paddleX >= 0) for (let i = 1; i < this.fX - 1 && i + 0.5 < this.paddleX; i++) for (let j = 1; j < this.fY - 1; j++) this.s[i * this.fY + j] = 0;
+      this._padWas = this.paddleX >= 0;
+    }
     let vmax = 0; for (let i = 0; i < this.np; i++) { const a = this.vel[2 * i], b = this.vel[2 * i + 1]; vmax = Math.max(vmax, a * a + b * b); }
     const sub = Math.min(this.maxSub, Math.max(1, Math.ceil(Math.sqrt(vmax) * dt / 1.0)));   // keep particles under ~1 cell per substep
     for (let k = 0; k < sub; k++) this.substep(dt / sub, gx, gy, ratio, iters);
@@ -788,7 +981,7 @@ class Flip {
     }
     this.np = k;
     this.pack(Math.max(1 + this.r, cx - rad), Math.max(1 + this.r, cy - rad), Math.min(this.fX - 1 - this.r, cx + rad), Math.min(this.fY - 1 - this.r, cy + rad),
-      (x, y) => (x - cx) * (x - cx) + (y - cy) * (y - cy) < r2);
+      (x, y) => (x - cx) * (x - cx) + (y - cy) * (y - cy) < r2 && this.free(x, y));
     this.rest = 0;
   }
 }
@@ -816,7 +1009,7 @@ class Apic extends Flip {
     if (ok) { const c = this.C; c[4 * i] = c[4 * i + 1] = c[4 * i + 2] = c[4 * i + 3] = 0; }
     return ok;
   }
-  fill(level) { super.fill(level); this.rest = this.restConst; }
+  fillFn(water) { super.fillFn(water); this.rest = this.restConst; this.C.fill(0); }
   stamp(cx, cy, rad) { super.stamp(cx, cy, rad); this.C.fill(0); this.rest = this.restConst; }
   updateDensity() { this.rest = this.restConst; super.updateDensity(); }
 
@@ -864,7 +1057,7 @@ class Apic extends Flip {
         for (let i = 0; i < f.length; i++) if (d[i] > 0) f[i] /= d[i];
         for (let i = 0; i < fX; i++) for (let j = 0; j < fY; j++) {          // no flow through walls
           const c = i * n + j, solid = type[c] === F_SOLID;
-          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = 0;
+          if (solid || (i > 0 && type[(i - 1) * n + j] === F_SOLID)) this.u[c] = i < this.paddleX + 0.5 ? this.paddleU : 0;
           if (solid || (j > 0 && type[c - 1] === F_SOLID)) this.v[c] = 0;
         }
       }
@@ -963,13 +1156,14 @@ class Apic extends Flip {
   }
   substep(dt, gx, gy) {
     const { np, pos, vel } = this; this._gx = gx; this._gy = gy; this._dt = dt;
-    this.updateDensity(); this.transfer(true); this.addGravity(dt, gx, gy); this.solve(this._iters, dt); this.transfer(false);
+    this.updateDensity(); this.transfer(true); this.addGravity(dt, gx, gy); this.applyJet(); this.solve(this._iters, dt); this.transfer(false);
     for (let i = 0; i < np; i++) {
       const dk = 1 / (1 + this.damp * dt); vel[2 * i] *= dk; vel[2 * i + 1] *= dk;
       const vx = vel[2 * i], vy = vel[2 * i + 1]; const sp = Math.sqrt(vx * vx + vy * vy);
       if (sp < this.sleep) { const t = Math.max(0, (sp - this.sleep * 0.2) / (this.sleep * 0.8)), f = 0.3 + 0.7 * t * t * (3 - 2 * t); vel[2 * i] *= f; vel[2 * i + 1] *= f; }
       pos[2 * i] += vel[2 * i] * dt; pos[2 * i + 1] += vel[2 * i + 1] * dt;
     }
+    this.walls();
   }
   step(dt, gx, gy, ratio, iters) { this._iters = iters; super.step(dt, gx, gy, ratio, iters); }
 }
@@ -996,7 +1190,7 @@ function buildFlip() {
         for (let c = 0; c < copies; c++) f.add(1 + u * nx + (c ? (Math.random() - 0.5) * 0.4 : 0), 1 + v * ny + (c ? (Math.random() - 0.5) * 0.4 : 0), old.vel[2 * i] * vs, old.vel[2 * i + 1] * vs);
       }
     }
-    FL.sim = f;
+    FL.sim = f; SOL.dirty = true;
     if (FL.texU) { FL.texU.destroy(); FL.texV.destroy(); gl.deleteBuffer(FL.vbo); }
     FL.texU = floatTex(nx + 1, ny); FL.texV = floatTex(nx, ny + 1);
     FL.ubuf = new Float32Array((nx + 1) * ny); FL.vbuf = new Float32Array(nx * (ny + 1));
@@ -1014,6 +1208,15 @@ function fillFlip() { FL.sim.fill(FILL_LEVEL); }
 function stepFlip(dt) {
   const f = FL.sim, nx = f.nx, ny = f.ny, gm = cfg.gravity * ny * (tilt.on ? cfg.tiltStrength : 1);
   f.damp = cfg.velocityDissipation;
+  const pd = paddleNow();
+  f.paddleX = pd ? 1 + pd.x * ny : -1; f.paddleU = pd ? pd.v * ny : 0;
+  const jb = scene.jet;
+  f.jet = jb ? { x0: 1 + jb[0] * nx, y0: 1 + jb[1] * ny, x1: 1 + jb[2] * nx, y1: 1 + jb[3] * ny, v: cfg.jetSpeed * ny } : null;
+  if (TAP.on) {                                    // the tap: new particles leaving the nozzle at the tap speed
+    const b = tapBox(), hw = TAP.halfWidth * ny, v = cfg.tapSpeed * ny, cx = 1 + 0.5 * (b[0] + b[2]) * nx, y0 = 1 + b[1] * ny;
+    FL.emit = (FL.emit || 0) + 2 * hw * v * dt * (f.restConst || 3.2);
+    for (; FL.emit >= 1; FL.emit--) f.add(cx + (Math.random() * 2 - 1) * hw, y0 - Math.random() * v * dt, 0, -v);
+  }
   f.step(dt, grav.x * gm, grav.y * gm, cfg.flipRatio, cfg.flipIters);
 
   // grid velocities -> small textures (only used for foam in the renderer)
@@ -1039,9 +1242,31 @@ function stepFlip(dt) {
 }
 
 // ----- simulation step -----------------------------------------------------
+function gridSolidFaces() {
+  const H = WS.grid[1], pd = paddleNow();
+  for (const [kind, T] of [[0, WS.U], [1, WS.V]]) {
+    texUnit = 0; const u = use(P.solidFaces); bindTex(u.uTex, T.read); bindTex(u.uSolid, WS.solid);
+    gl.uniform1f(u.kind, kind); gl.uniform1f(u.paddleX, pd ? pd.x * H : -1); gl.uniform1f(u.paddleU, pd ? pd.v * H : 0);
+    blit(T.write); T.swap();
+  }
+}
+function gridJet(box, speed) {                 // box in uv, speed in screen heights / s (+ = up)
+  const [W, H] = WS.grid;
+  for (const [kind, T] of [[0, WS.U], [1, WS.V]]) {
+    texUnit = 0; const u = use(P.jetFaces); bindTex(u.uTex, T.read);
+    gl.uniform2f(u.gridSize, W, H); gl.uniform4f(u.box, box[0], box[1], box[2], box[3]); gl.uniform1f(u.kind, kind); gl.uniform1f(u.vel, speed * H);
+    blit(T.write); T.swap();
+  }
+}
 function stepWater(dt) {
   const [W, H] = WS.grid, L0 = WS.lv[0];
   let u;
+  if (TAP.on) {                                  // the tap keeps its nozzle full of water...
+    const A = canvas.width / canvas.height;
+    texUnit = 0; u = use(P.stampBoxLS); bindTex(u.uTex, lset.read);
+    gl.uniform4f(u.box, ...tapBox()); gl.uniform1f(u.aspect, A); blit(lset.write); lset.swap();
+    waterTarget = Math.min(0.9, waterTarget + 2 * TAP.halfWidth * cfg.tapSpeed * dt / A);   // ...and the volume to keep grows by what it lets out
+  }
   // fill fraction at simulation resolution
   texUnit = 0; u = use(P.phiDown); bindTex(u.uPsi, lset.read); gl.uniform2f(u.cell, 1 / W, 1 / H); gl.uniform1f(u.eps, 2 / H); blit(WS.phi);   // +-2 cells: a 1-cell transition went unstable when the frame time varies
 
@@ -1060,9 +1285,14 @@ function stepWater(dt) {
     gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.acc, acc); gl.uniform1f(u.kind, kind);
     blit(T.write); T.swap();
   }
+  gridSolidFaces();
+  if (scene.jet) gridJet(scene.jet, cfg.jetSpeed);
+  if (TAP.on) gridJet(tapBox(), -cfg.tapSpeed);
 
   // pressure projection with density-dependent coefficients
-  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.rhoA, 1 / Math.min(cfg.density, CAN_F32 ? 2000 : 30)); blit(L0.b);
+  const pdb = paddleNow();
+  texUnit = 0; u = use(P.beta); bindTex(u.uPhi, WS.phi); bindTex(u.uSolid, WS.solid);
+  gl.uniform1f(u.rhoA, 1 / Math.min(cfg.density, CAN_F32 ? 2000 : 30)); gl.uniform1f(u.paddleX, pdb ? pdb.x * H : -1); blit(L0.b);
   for (let l = 0; l + 1 < WS.lv.length; l++) { texUnit = 0; u = use(P.restrictBetaW); bindTex(u.uB, WS.lv[l].b); blit(WS.lv[l + 1].b); }
   texUnit = 0; u = use(P.divMAC); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read); blit(L0.d);
   // warm start from last step's pressure, rescaled for the time step (hydrostatic pressure here is proportional to dt;
@@ -1075,6 +1305,7 @@ function stepWater(dt) {
   texUnit = 0; u = use(P.projectU); bindTex(u.uU, WS.U.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.airCap, 3 * H); blit(WS.U.write);
   texUnit = 0; u = use(P.projectV); bindTex(u.uV, WS.V.read); bindTex(u.uP, L0.p.read); bindTex(u.uB, L0.b); bindTex(u.uPhi, WS.phi); gl.uniform1f(u.airCap, 3 * H); blit(WS.V.write);
   WS.U.swap(); WS.V.swap();
+  gridSolidFaces();
 
   // move the surface with the new velocity: MacCormack advection of psi, then re-initialisation
   const T = lset.read, texSize = [T.w, T.h];
@@ -1105,6 +1336,8 @@ function render() {
   gl.uniform3fv(w['balls[0]'], bd); gl.uniform1f(w.aspect, canvas.width / canvas.height);
   gl.uniform2f(w.gridSize, W, H); gl.uniform2f(w.gdir, grav.x, grav.y);
   gl.uniform1f(w.time, performance.now() / 1000); gl.uniform1f(w.velScale, H);
+  ensureMask(); bindTex(w.uMask, SOL.tex);
+  const pd = paddleNow(); gl.uniform1f(w.paddleUV, pd ? pd.x / (canvas.width / canvas.height) : -1);
   blit(null);
 }
 
@@ -1122,14 +1355,140 @@ function stampBall(x, y, r) {
     blit(T.write); T.swap();
   }
   // The volume changed, so re-measure it and make that the new volume to conserve.
+  const v = measureWater(); waterTarget = Math.min(0.9, isNaN(v) ? waterTarget + Math.PI * r * r / aspect * 0.5 : v);
+}
+function measureWater() {                       // mean fill fraction of the tank (solids excluded), read back once
   texUnit = 0; use(P.massDown); bindTex(P.massDown.u.uTex, water.read); blit(massTex);
+  gl.bindTexture(gl.TEXTURE_2D, massTex.tex); gl.generateMipmap(gl.TEXTURE_2D);
   try {
     gl.bindFramebuffer(gl.FRAMEBUFFER, massTex.fbo);
     const a = new Float32Array(128 * 128 * 4); gl.readPixels(0, 0, 128, 128, gl.RGBA, gl.FLOAT, a);
     let sum = 0; for (let i = 0; i < a.length; i += 4) sum += a[i];
-    waterTarget = Math.min(0.9, sum / (128 * 128));
-  } catch (_) { waterTarget = Math.min(0.9, waterTarget + Math.PI * r * r / aspect * 0.5); }
+    return sum / (128 * 128);
+  } catch (_) { return NaN; }
 }
+
+// ----- obstacles and scenes ---------------------------------------------------
+function ensureMask() {                            // the obstacle mask: 512 rows, as many columns as the screen's aspect needs
+  const h = 512, w = Math.max(8, Math.round(h * canvas.width / canvas.height));
+  if (SOL.w === w && SOL.h === h && SOL.tex) return false;
+  SOL.w = w; SOL.h = h; SOL.mat = new Uint8Array(w * h); SOL.dirty = true;
+  if (SOL.tex) gl.deleteTexture(SOL.tex.tex);
+  SOL.tex = byteTex(w, h, gl.RG8, gl.RG, gl.LINEAR, new Uint8Array(w * h * 2));
+  return true;
+}
+function maskAt(u, v) {
+  const i = Math.min(SOL.w - 1, Math.max(0, Math.floor(u * SOL.w))), j = Math.min(SOL.h - 1, Math.max(0, Math.floor(v * SOL.h)));
+  return SOL.mat[j * SOL.w + i];
+}
+function paintCircle(u, v, rH, m) {                // rH in screen heights
+  const { w, h, mat } = SOL, r = rH * h, cx = u * w, cy = v * h;
+  for (let j = Math.max(0, Math.floor(cy - r)); j <= Math.min(h - 1, Math.ceil(cy + r)); j++)
+    for (let i = Math.max(0, Math.floor(cx - r)); i <= Math.min(w - 1, Math.ceil(cx + r)); i++)
+      if ((i + 0.5 - cx) ** 2 + (j + 0.5 - cy) ** 2 <= r * r) mat[j * w + i] = m;
+  SOL.dirty = true;
+}
+function paintLine(u0, v0, u1, v1, rH, m) {
+  const A = SOL.w / SOL.h, len = Math.hypot((u1 - u0) * A, v1 - v0), n = Math.max(1, Math.ceil(len / (rH * 0.4)));
+  for (let k = 0; k <= n; k++) paintCircle(u0 + (u1 - u0) * k / n, v0 + (v1 - v0) * k / n, rH, m);
+}
+// Push the mask to everything that needs it: the renderer's texture, the grid solver's solid cells, the particles.
+function updateSolids(force = false) {
+  ensureMask();
+  if (!SOL.dirty && !force) return;
+  SOL.dirty = false;
+  const { w, h, mat } = SOL;
+  let g = Uint8Array.from(mat);                    // spread each material two texels outward so anti-aliased edges know it
+  for (let pass = 0; pass < 2; pass++) {
+    const g2 = Uint8Array.from(g);
+    for (let j = 0; j < h; j++) for (let i = 0; i < w; i++) {
+      const k = j * w + i; if (g[k]) continue;
+      g2[k] = Math.max(i > 0 ? g[k - 1] : 0, i < w - 1 ? g[k + 1] : 0, j > 0 ? g[k - w] : 0, j < h - 1 ? g[k + w] : 0);
+    }
+    g = g2;
+  }
+  const data = new Uint8Array(w * h * 2);
+  for (let k = 0; k < w * h; k++) { data[2 * k] = mat[k] ? 255 : 0; data[2 * k + 1] = g[k] * 40; }
+  gl.bindTexture(gl.TEXTURE_2D, SOL.tex.tex); gl.pixelStorei(gl.UNPACK_ALIGNMENT, 1);
+  gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, w, h, gl.RG, gl.UNSIGNED_BYTE, data);
+  // a cell counts as solid if any of four sample points inside it is solid (keeps thin walls watertight)
+  const solidCell = (u0, v0, du, dv) => maskAt(u0 + 0.25 * du, v0 + 0.25 * dv) || maskAt(u0 + 0.75 * du, v0 + 0.25 * dv)
+                                    || maskAt(u0 + 0.25 * du, v0 + 0.75 * dv) || maskAt(u0 + 0.75 * du, v0 + 0.75 * dv);
+  if (WS.solid) {
+    const [W, H] = WS.grid, cells = new Uint8Array(W * H);
+    for (let j = 0; j < H; j++) for (let i = 0; i < W; i++) cells[j * W + i] = solidCell(i / W, j / H, 1 / W, 1 / H) ? 255 : 0;
+    gl.bindTexture(gl.TEXTURE_2D, WS.solid.tex);
+    gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, W, H, gl.RED, gl.UNSIGNED_BYTE, cells);
+  }
+  if (FL.sim) { const f = FL.sim; f.setObstacles((u, v) => solidCell(u - 0.5 / f.nx, v - 0.5 / f.ny, 1 / f.nx, 1 / f.ny)); }
+}
+function paddleNow() {                             // wave maker plate: position (screen heights from the left wall) and speed
+  if (!PADDLE.on) return null;
+  const w = 2 * Math.PI / cfg.paddlePeriod, t = PADDLE.t;
+  return { x: 0.04 + cfg.paddleAmp * (1 - Math.cos(w * t)), v: cfg.paddleAmp * w * Math.sin(w * t) };   // starts at rest, smooth
+}
+function tapBox() { const A = canvas.width / canvas.height, hw = TAP.halfWidth / A; return [0.5 - hw, TAP.y0, 0.5 + hw, TAP.y1]; }
+
+// Ready-made scenes. Coordinates in screen heights: x from 0 (left) to A (the screen's width/height), y from 0 (floor) to 1.
+// water(x, y) is a signed distance (< 0 inside the water); solids(x, y) returns a material (0 = nothing).
+const ell = (x, y, cx, cy, rx, ry, wob) => { const dx = (x - cx) / rx, dy = (y - cy) / ry; return dx * dx + dy * dy < 1 + wob * Math.sin(7 * Math.atan2(dy, dx) + cx * 13); };
+const SCENES = {
+  tank: { label: 'Tank', sub: 'A plain tank of water', water: (x, y) => y - 0.4 },
+  dam: { label: 'Dam break', sub: 'A water column released at once, with a block downstream',
+    water: (x, y, A) => Math.max(x - Math.min(0.42 * A, 0.32), y - 0.6),
+    solids: (x, y, A) => (x > 0.78 * A && x < 0.78 * A + 0.05 && y < 0.09) ? 1 : 0 },
+  wavepool: { label: 'Wave pool', sub: 'A piston wave maker sends waves up a sandy beach', paddle: true,
+    water: (x, y) => y - 0.3,
+    solids: (x, y, A) => (x > 0.5 * A && y < (x - 0.5 * A) / (0.5 * A) * 0.42) ? 2 : 0 },
+  fountain: { label: 'Fountain', sub: 'A submerged pump drives a jet up through a pipe',
+    water: (x, y) => y - 0.35,
+    solids: (x, y, A) => { const d = Math.abs(x - 0.5 * A); return (d > 0.022 && d < 0.034 && y > 0.05 && y < 0.47) ? 5 : 0; },
+    jet: A => [(0.5 * A - 0.02) / A, 0.07, (0.5 * A + 0.02) / A, 0.44] },
+  aquarium: { label: 'Aquarium', sub: 'Sand, rocks and a deep tank',
+    water: (x, y) => y - 0.85,
+    solids: (x, y, A) => {
+      if (y < 0.07 + 0.012 * Math.sin(x * 23) + 0.008 * Math.sin(x * 57 + 1.3)) return 2;
+      if (ell(x, y, 0.22 * A, 0.07, 0.09, 0.07, 0.12) || ell(x, y, 0.6 * A, 0.08, 0.05, 0.13, 0.1)
+        || ell(x, y, 0.8 * A, 0.07, 0.06, 0.05, 0.15) || ell(x, y, 0.41 * A, 0.06, 0.035, 0.03, 0.2)) return 3;
+      return 0;
+    } },
+  glass: { label: 'Glass being filled', sub: 'A tap pours into a glass until it overflows', tap: true,
+    water: () => 1,
+    solids: (x, y, A) => { const d = Math.abs(x - 0.5 * A), wi = Math.min(0.1, 0.3 * A);
+      return ((d > wi && d < wi + 0.012 && y < 0.3) || (d < wi + 0.012 && y < 0.025)) ? 4 : 0; } },
+};
+function applySceneWater() {                       // (re)fill the current scene's water for the current algorithm
+  const S = SCENES[scene.name] || SCENES.tank, A = canvas.width / canvas.height, wfn = (u, v) => S.water(u * A, v, A);
+  updateSolids(true);
+  if (isParticles()) {
+    const f = FL.sim, pd = paddleNow(); f.paddleX = pd ? 1 + pd.x * f.ny : -1;
+    f.fillFn(wfn); FL.emit = 0;
+  } else {
+    clearFB(water.read); clearFB(water.write); clearWaterFlow();
+    const T = lset.read, d = new Float32Array(T.w * T.h);
+    for (let j = 0; j < T.h; j++) for (let i = 0; i < T.w; i++) d[j * T.w + i] = Math.max(-LS_BAND, Math.min(LS_BAND, wfn((i + 0.5) / T.w, (j + 0.5) / T.h)));
+    gl.bindTexture(gl.TEXTURE_2D, T.tex); gl.texSubImage2D(gl.TEXTURE_2D, 0, 0, 0, T.w, T.h, gl.RED, gl.FLOAT, d);
+    lsRefresh();
+    const v = measureWater(); waterTarget = isNaN(v) ? FILL_LEVEL : v;
+  }
+}
+function loadScene(name) {
+  const S = SCENES[name] || SCENES.tank, A = canvas.width / canvas.height;
+  scene.name = SCENES[name] ? name : 'tank';
+  ensureMask(); SOL.mat.fill(0);
+  if (S.solids) for (let j = 0; j < SOL.h; j++) for (let i = 0; i < SOL.w; i++) SOL.mat[j * SOL.w + i] = S.solids((i + 0.5) / SOL.h, (j + 0.5) / SOL.h, A);
+  SOL.dirty = true;
+  PADDLE.on = !!S.paddle; PADDLE.t = 0; TAP.on = !!S.tap; scene.jet = S.jet ? S.jet(A) : null;
+  applySceneWater();
+  syncSceneButtons();
+}
+function syncSceneButtons() {
+  $('sceneBtn').textContent = 'Scene: ' + (SCENES[scene.name] || SCENES.tank).label;
+  $('paddle').textContent = 'Wave maker: ' + (PADDLE.on ? 'on' : 'off');
+  $('tap').textContent = 'Tap: ' + (TAP.on ? 'on' : 'off');
+  $('tool').textContent = 'Tool: ' + { water: 'Water', wall: 'Draw wall', erase: 'Erase wall' }[tool];
+}
+function waterVolume() { return isParticles() ? FL.sim.np / (FL.sim.nx * FL.sim.ny * 3.2) : waterTarget; }
 
 // ----- splats / input ------------------------------------------------------
 function splatRadius() { const aspect = canvas.width / canvas.height; return (cfg.splatRadius / 100) * (aspect > 1 ? aspect : 1); }
@@ -1158,8 +1517,13 @@ canvas.addEventListener('pointerdown', e => {
   try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
   const r = canvas.getBoundingClientRect();
   const x = (e.clientX - r.left) / r.width, y = 1 - (e.clientY - r.top) / r.height;
-  const p = { x, y, dx: 0, dy: 0, moved: false, hold: null };
+  const p = { x, y, dx: 0, dy: 0, moved: false, hold: null, draw: false };
   pointers.set(e.pointerId, p);
+  $('scenes').classList.remove('open');
+  if (tool !== 'water') {                                      // drawing / erasing walls
+    p.draw = true; paintCircle(x, y, tool === 'erase' ? cfg.wallSize * 2 : cfg.wallSize, tool === 'erase' ? 0 : 1);
+    return;
+  }
   p.hold = { on: true, r: 0, cx: e.clientX, cy: e.clientY };   // hold still to grow a water ball
 });
 canvas.addEventListener('pointermove', e => {
@@ -1167,6 +1531,10 @@ canvas.addEventListener('pointermove', e => {
   e.preventDefault();
   const r = canvas.getBoundingClientRect();
   const x = (e.clientX - r.left) / r.width, y = 1 - (e.clientY - r.top) / r.height;
+  if (p.draw) {
+    paintLine(p.x, p.y, x, y, tool === 'erase' ? cfg.wallSize * 2 : cfg.wallSize, tool === 'erase' ? 0 : 1);
+    p.x = x; p.y = y; return;
+  }
   p.dx += aspectDX(x - p.x); p.dy += aspectDY(y - p.y);
   p.x = x; p.y = y; p.moved = true;
   if (p.hold && p.hold.on && Math.hypot(e.clientX - p.hold.cx, e.clientY - p.hold.cy) > 14) p.hold.on = false;   // dragging = stirring, not a ball
@@ -1183,6 +1551,7 @@ document.addEventListener('gesturestart', e => e.preventDefault());
 const BALL_MAX = 0.22;    // largest ball radius, in screen heights
 function applyPointers(dt) {
   for (const p of pointers.values()) {
+    if (p.draw) continue;
     if (p.hold && p.hold.on) {            // still holding: grow the ball, don't stir
       p.hold.r = Math.min(BALL_MAX, p.hold.r + cfg.ballGrowth * dt);
       p.dx = p.dy = 0; p.moved = false; continue;
@@ -1220,9 +1589,21 @@ if ('DeviceMotionEvent' in window && matchMedia('(pointer: coarse)').matches) {
     } catch (_) {}
   };
 }
-$('clear').onclick = () => { clearFB(water.read); clearFB(water.write); clearWaterFlow(); fillWater(); if (FL.sim) fillFlip(); };
+$('clear').onclick = () => loadScene(scene.name);
+$('tool').onclick = () => { tool = { water: 'wall', wall: 'erase', erase: 'water' }[tool]; syncSceneButtons(); };
+$('paddle').onclick = () => { PADDLE.on = !PADDLE.on; PADDLE.t = 0; syncSceneButtons(); };
+$('tap').onclick = () => { TAP.on = !TAP.on; syncSceneButtons(); };
+{
+  const box = $('scenes');
+  for (const [name, S] of Object.entries(SCENES)) {
+    const b = document.createElement('button'); b.innerHTML = `${S.label}<small>${S.sub}</small>`;
+    b.onclick = () => { box.classList.remove('open'); loadScene(name); };
+    box.appendChild(b);
+  }
+  $('sceneBtn').onclick = () => box.classList.toggle('open');
+}
 
-window.addEventListener('resize', () => { if (resizeCanvas()) initBuffers(); });
+window.addEventListener('resize', () => { if (resizeCanvas()) { initBuffers(); if (ensureMask()) loadScene(scene.name); } });
 
 // ----- settings panel --------------------------------------------------------
 const GRID = ['grid'], FLIPA = ['flip'], PARTS = ['flip', 'apic'];
@@ -1235,6 +1616,11 @@ const SCHEMA = [
     hint: 'Real water is ≈ 800× denser than air. Lower = lighter water, faster but floatier splashes.' },
   { k: 'ballGrowth', label: 'Water ball growth speed', min: 0.05, max: 1, step: 0.05 },
   { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1 },
+  { k: 'paddleAmp', label: 'Wave maker stroke', min: 0.005, max: 0.06, step: 0.005, hint: 'Half the piston travel, in screen heights. Bigger = taller waves.' },
+  { k: 'paddlePeriod', label: 'Wave maker period (s)', min: 0.15, max: 2, step: 0.05, hint: 'Short periods make short, steep waves; long periods make the tank slosh.' },
+  { k: 'jetSpeed', label: 'Fountain pump speed', min: 1, max: 8, step: 0.25 },
+  { k: 'tapSpeed', label: 'Tap flow speed', min: 0.5, max: 4, step: 0.1 },
+  { k: 'wallSize', label: 'Wall brush size', min: 0.006, max: 0.05, step: 0.002 },
   { k: 'velocityDissipation', label: 'Velocity damping (viscosity-like)', min: 0, max: 4, step: 0.05, algos: ['grid', 'apic'] },
   { k: 'pressure', label: 'Pressure persistence', min: 0, max: 1, step: 0.01, algos: GRID },
   { k: 'splatRadius', label: 'Brush size', min: 0.05, max: 1, step: 0.01 },
@@ -1242,7 +1628,7 @@ const SCHEMA = [
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg8';
+const KEY = 'fluidCfg10';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
@@ -1285,8 +1671,8 @@ for (const s of SCHEMA) {
 }
 function setAlgo(a) {
   cfg.waterAlgo = a;
-  if (a !== 'grid') { if (FL.sim && (FL.sim instanceof Apic) !== (a === 'apic')) FL.sim = null; buildFlip(); fillFlip(); }
-  else { clearFB(water.read); clearFB(water.write); clearWaterFlow(); fillWater(); }
+  if (a !== 'grid') { if (FL.sim && (FL.sim instanceof Apic) !== (a === 'apic')) FL.sim = null; buildFlip(); }
+  applySceneWater();
   if (widgets.waterAlgo) widgets.waterAlgo();
   applyModeVisibility();
 }
@@ -1411,6 +1797,7 @@ async function benchAlgo(algo, progress) {
 }
 async function runBenchmark(progress = () => {}) {
   const saved = { algo: cfg.waterAlgo, auto: cfg.auto };
+  saved.scene = scene.name; loadScene('tank');
   bench.on = true; cfg.auto = false;
   const ext = gl.getExtension('WEBGL_debug_renderer_info');
   const out = {
@@ -1420,14 +1807,15 @@ async function runBenchmark(progress = () => {}) {
     results: {},
   };
   try { for (const algo of ALGOS) out.results[algo] = await benchAlgo(algo, progress); }
-  finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
+  finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; loadScene(saved.scene); }
   bench.result = out; window.benchResult = out;
   return out;
 }
 // Frame cost of both algorithms at every resolution level (splash scene, no settling analysis): shows
 // which level each algorithm can afford on this device.
 async function runSweep(progress = () => {}) {
-  const saved = { algo: cfg.waterAlgo, auto: cfg.auto, level: cfg.level };
+  const saved = { algo: cfg.waterAlgo, auto: cfg.auto, level: cfg.level, scene: scene.name };
+  loadScene('tank');
   bench.on = true; cfg.auto = false;
   const ext = gl.getExtension('WEBGL_debug_renderer_info');
   const out = { when: new Date().toISOString(), gpu: ext ? gl.getParameter(ext.UNMASKED_RENDERER_WEBGL) : 'unknown', cores: navigator.hardwareConcurrency || null,
@@ -1449,7 +1837,7 @@ async function runSweep(progress = () => {}) {
       }
       out.levels.push(row);
     }
-  } finally { cfg.level = saved.level; initBuffers(); setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
+  } finally { cfg.level = saved.level; initBuffers(); setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; loadScene(saved.scene); }
   const best = a => { const ok = out.levels.filter(r => r[a].p95 <= 16.7); return ok.length ? ok[ok.length - 1].level : null; };
   out.recommended = Object.fromEntries(ALGOS.map(a => [a, best(a)]));       // highest level whose 95th-percentile frame still fits 60 fps
   window.sweepResult = out; return out;
@@ -1541,10 +1929,11 @@ async function theoryAlgoRun(algo, progress) {
 }
 async function runTheory(progress = () => {}) {
   const saved = { algo: cfg.waterAlgo, auto: cfg.auto };
+  saved.scene = scene.name; loadScene('tank');
   bench.on = true; cfg.auto = false;
   const out = { when: new Date().toISOString(), level: cfg.level, settings: { gravity: cfg.gravity, density: cfg.density, flipRatio: cfg.flipRatio, flipIters: cfg.flipIters }, results: {} };
   try { for (const algo of ALGOS) out.results[algo] = await theoryAlgo(algo, progress); }
-  finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; }
+  finally { setAlgo(saved.algo); cfg.auto = saved.auto; bench.on = false; loadScene(saved.scene); }
   window.theoryResult = out; return out;
 }
 function formatTheory(r) {
@@ -1599,11 +1988,15 @@ if (/[?&]sweep\b/.test(location.search)) setTimeout(() => runSweep(m => { docume
 if (/[?&]bench\b/.test(location.search)) setTimeout(() => runBenchmark(m => { document.title = m; }).then(r => { document.title = 'bench done'; console.log('benchmark', JSON.stringify(r)); }), 500);
 
 // ----- main loop -----------------------------------------------------------
+loadScene('tank');
 let last = performance.now();
 function frame(now) {
   const raw = (now - last) / 1000; last = now;
   const dt = Math.min(Math.max(raw, 0.001), 1 / 30);
   if (bench.on) { requestAnimationFrame(frame); return; }          // the benchmark drives the simulation itself
+  updateSolids();
+  if (PADDLE.on) PADDLE.t += dt;
+  if (TAP.on && waterVolume() > 0.7) { TAP.on = false; syncSceneButtons(); }   // stop before the tank overflows
   updateGravity(dt); applyPointers(dt);
   if (isParticles()) stepFlip(dt); else stepWater(dt);
   render();
