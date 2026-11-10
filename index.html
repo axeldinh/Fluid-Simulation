@@ -39,6 +39,10 @@
   #scenes.open { display: flex; }
   #scenes button { font: inherit; text-align: left; color: #fffd; background: #ffffff14; border: 1px solid #ffffff22; border-radius: 10px; padding: 10px 14px; }
   #scenes button small { display: block; color: #fff8; font-size: 11px; margin-top: 3px; }
+  #gauge { position: fixed; top: calc(10px + env(safe-area-inset-top)); left: calc(10px + env(safe-area-inset-left)); width: 280px; height: 100px;
+    display: none; border-radius: 12px; background: #000000a0; backdrop-filter: blur(8px); -webkit-backdrop-filter: blur(8px); pointer-events: none; z-index: 2; }
+  #gaugeLine { position: fixed; top: 0; bottom: 0; width: 2px; margin-left: -1px; display: none; pointer-events: none;
+    background: linear-gradient(transparent 15%, #ffd54a88 35%, #ffd54a88 80%, transparent 95%); }
   #msg { position: fixed; inset: 0; display: none; align-items: center; justify-content: center; padding: 24px;
     color: #fff; font: 16px/1.4 system-ui, sans-serif; text-align: center; white-space: pre-wrap; }
 </style>
@@ -51,12 +55,15 @@
   <button id="tool">Tool: Water</button>
   <button id="paddle">Wave maker: off</button>
   <button id="tap">Tap: off</button>
+  <button id="zoom" hidden>Zoom: off</button>
   <button id="motion" hidden>Tilt: off</button>
   <button id="gear">Settings</button>
   <a id="to3d" href="3d.html">3D</a>
   <div id="stats"></div>
 </div>
 <div id="scenes"></div>
+<canvas id="gauge" width="560" height="200"></canvas>
+<div id="gaugeLine"></div>
 <div id="panel"></div>
 <div id="msg"></div>
 <script>
@@ -112,6 +119,8 @@ const cfg = {
   tapSpeed: 1.0,      // tap: outflow speed, screen heights per second
   jetSpeed: 2.5,      // fountain pump: jet speed, screen heights per second
   wallSize: 0.016,    // radius of the wall brush, screen heights
+  rogueSteep: 0.24,   // rogue wave: linear focus amplitude x peak wavenumber (above ~0.3 it breaks violently)
+  rogueSea: 1,        // rogue wave: strength of the random background sea
   maxDpr: 1.5,
 };
 
@@ -122,7 +131,8 @@ const SOL = { w: 0, h: 0, mat: null, tex: null, dirty: true };
 const PADDLE = { on: false, t: 0 };                     // piston wave maker on the left wall
 const TAP = { on: false, halfWidth: 0.012, y0: 0.9, y1: 0.96 };   // nozzle near the top centre (uv y range)
 const scene = { name: 'tank', jet: null };              // jet: fountain pump region (uv box) or null
-let tool = 'water';                                     // 'water' (stir / hold for a ball), 'wall', 'erase'
+let tool = 'water';
+const VIEW = { cx: 0.5, cy: 0.5, s: 1 };              // camera: centre of the view and the fraction of the tank shown (1 = all)                                     // 'water' (stir / hold for a ball), 'wall', 'erase'
 
 // ----- shaders -------------------------------------------------------------
 const VERT = `#version 300 es
@@ -414,7 +424,7 @@ const FRAG = {
       o = textureLod(uSource, p0 / gridSize, 0.0);
     }`,
 
-  displayWater: HEAD + VELSRC + `uniform sampler2D uWater, uMask; uniform vec2 gdir; uniform float aspect, time, velScale, paddleUV; uniform vec3 balls[4];
+  displayWater: HEAD + VELSRC + `uniform sampler2D uWater, uMask; uniform vec2 gdir; uniform float aspect, time, velScale, paddleUV; uniform vec3 balls[4]; uniform vec3 view;
     float W(vec2 uv){ return textureLod(uWater, uv, 0.0).x; }
     float hash(vec2 p){ return fract(sin(dot(p, vec2(127.1, 311.7))) * 43758.5453); }
     float noise(vec2 p){
@@ -430,26 +440,27 @@ const FRAG = {
       return base * (0.8 + 0.3 * smoothstep(1.1, 0.2, length(uv - vec2(0.5, 0.6))));
     }
     void main(){
-      vec2 ts = vec2(vR.x - vUv.x, vT.y - vUv.y);
+      vec2 U = view.xy + (vUv - 0.5) * view.z;                         // camera: zoomed view of the tank
+      vec2 ts = vec2(vR.x - vUv.x, vT.y - vUv.y) * view.z;
       vec2 up = vec2(-gdir.x / aspect, -gdir.y);                       // uv direction pointing away from gravity
-      float w = W(vUv);
-      float s = (w * 4.0 + W(vUv + vec2(ts.x * 1.5, 0.0)) + W(vUv - vec2(ts.x * 1.5, 0.0))
-                         + W(vUv + vec2(0.0, ts.y * 1.5)) + W(vUv - vec2(0.0, ts.y * 1.5))) / 8.0;
+      float w = W(U);
+      float s = (w * 4.0 + W(U + vec2(ts.x * 1.5, 0.0)) + W(U - vec2(ts.x * 1.5, 0.0))
+                         + W(U + vec2(0.0, ts.y * 1.5)) + W(U - vec2(0.0, ts.y * 1.5))) / 8.0;
       vec2 g2 = ts * 4.0;
-      vec2 grad = vec2(W(vUv + vec2(g2.x, 0.0)) - W(vUv - vec2(g2.x, 0.0)), W(vUv + vec2(0.0, g2.y)) - W(vUv - vec2(0.0, g2.y)));
+      vec2 grad = vec2(W(U + vec2(g2.x, 0.0)) - W(U - vec2(g2.x, 0.0)), W(U + vec2(0.0, g2.y)) - W(U - vec2(0.0, g2.y)));
       float m = smoothstep(0.3, 0.7, s);
 
       float depth = w * 0.004, prev = 0.0;                              // how much water lies above this pixel
       for (int i = 1; i <= 12; i++) {
         float t = 0.01 * float(i) * (1.0 + 0.4 * float(i));
-        depth += W(vUv + up * t) * (t - prev); prev = t;
+        depth += W(U + up * t) * (t - prev); prev = t;
       }
-      vec3 bg = backdrop(vUv + grad * 0.03);                            // refracted view of the back wall
+      vec3 bg = backdrop(U + grad * 0.03);                            // refracted view of the back wall
       vec3 T = exp(-vec3(5.0, 1.6, 0.9) * depth);                      // Beer-Lambert: red dies first
       vec3 scatter = vec3(0.02, 0.30, 0.45) * (0.35 + 0.65 * exp(-depth * 2.0));
       vec3 water = bg * T * 1.1 + scatter * (1.0 - T);
 
-      vec2 cq = vec2(vUv.x * aspect, vUv.y) * 9.0;                      // caustics, fading with depth
+      vec2 cq = vec2(U.x * aspect, U.y) * 9.0;                      // caustics, fading with depth
       cq += grad * 10.0;                                                  // pattern is fixed; waves bend it (nothing moves at rest)
       float cA = noise(cq), cB = noise(cq * 1.7 + 11.3);
       water += vec3(0.5, 0.85, 1.0) * pow(1.0 - abs(cA - cB), 6.0) * exp(-depth * 4.0) * 0.25;
@@ -461,28 +472,28 @@ const FRAG = {
       float fres = 0.04 + 0.96 * pow(1.0 - n.z, 4.0);
       water += vec3(0.85, 0.95, 1.0) * (spec * 0.9 + fres * smoothstep(0.03, 0.4, edge) * 0.8);
 
-      float sp = length(velAt(vUv * gridSize)) / velScale;              // white water: fast flow near the surface
-      float foam = smoothstep(0.5, 1.6, sp) * smoothstep(0.1, 0.0, depth) * (0.4 + 0.6 * noise(vec2(vUv.x * aspect, vUv.y) * 80.0 + sp * 7.0));
+      float sp = length(velAt(U * gridSize)) / velScale;              // white water: fast flow near the surface
+      float foam = smoothstep(0.5, 1.6, sp) * smoothstep(0.1, 0.0, depth) * (0.4 + 0.6 * noise(vec2(U.x * aspect, U.y) * 80.0 + sp * 7.0));
       water = mix(water, vec3(0.9, 0.96, 1.0), clamp(foam, 0.0, 0.85));
 
-      vec3 c = mix(backdrop(vUv), water, m);
+      vec3 c = mix(backdrop(U), water, m);
 
       // ---- solids: walls you drew, sand, rocks, glass, metal, and the wave maker's plate
       vec2 mts = vec2(textureSize(uMask, 0));
-      float cov = vUv.x < paddleUV ? 1.0 : texture(uMask, vUv).x;
+      float cov = U.x < paddleUV ? 1.0 : texture(uMask, U).x;
       if (cov > 0.02) {
-        vec2 q = vec2(vUv.x * aspect, vUv.y);
-        ivec2 mi = clamp(ivec2(vUv * mts), ivec2(0), ivec2(mts) - 1);
+        vec2 q = vec2(U.x * aspect, U.y);
+        ivec2 mi = clamp(ivec2(U * mts), ivec2(0), ivec2(mts) - 1);
         float mat = floor(texelFetch(uMask, mi, 0).y * 255.0 / 40.0 + 0.5);
         vec2 e = 1.5 / mts;
-        vec2 sg = vec2(texture(uMask, vUv + vec2(e.x, 0.0)).x - texture(uMask, vUv - vec2(e.x, 0.0)).x,
-                       texture(uMask, vUv + vec2(0.0, e.y)).x - texture(uMask, vUv - vec2(0.0, e.y)).x);
+        vec2 sg = vec2(texture(uMask, U + vec2(e.x, 0.0)).x - texture(uMask, U - vec2(e.x, 0.0)).x,
+                       texture(uMask, U + vec2(0.0, e.y)).x - texture(uMask, U - vec2(0.0, e.y)).x);
         float rim = clamp(dot(-sg, normalize(vec2(-0.6, 0.8))), -1.0, 1.0);     // bevel, lit from the upper left
         float alpha = smoothstep(0.35, 0.65, cov);
         vec3 sc;
         bool seeThrough = false;
-        if (vUv.x < paddleUV) {                                         // wave maker: yellow plate, dark drive behind it
-          float dEdge = (paddleUV - vUv.x) * aspect;
+        if (U.x < paddleUV) {                                         // wave maker: yellow plate, dark drive behind it
+          float dEdge = (paddleUV - U.x) * aspect;
           sc = dEdge < 0.012 ? vec3(0.95, 0.68, 0.18) * (0.75 + 0.3 * smoothstep(0.012, 0.0, dEdge))
                              : vec3(0.16, 0.18, 0.21) + 0.05 * step(0.5, fract(q.y * 14.0));
           alpha = 1.0; rim = 0.0;
@@ -508,7 +519,7 @@ const FRAG = {
       }
       for (int i = 0; i < 4; i++) {                                     // growing water balls being held down
         if (balls[i].z <= 0.0) continue;
-        vec2 d = vUv - balls[i].xy; d.x *= aspect;
+        vec2 d = U - balls[i].xy; d.x *= aspect;
         float r = length(d), inside = 1.0 - smoothstep(balls[i].z - 0.004, balls[i].z, r);
         float rim = inside * smoothstep(balls[i].z - 0.014, balls[i].z - 0.004, r);
         c = mix(c, vec3(0.30, 0.72, 1.0), inside * 0.8) + vec3(0.6, 0.9, 1.0) * rim * 0.6;
@@ -1370,7 +1381,7 @@ function render() {
   gl.uniform3fv(w['balls[0]'], bd); gl.uniform1f(w.aspect, canvas.width / canvas.height);
   gl.uniform2f(w.gridSize, W, H); gl.uniform2f(w.gdir, grav.x, grav.y);
   gl.uniform1f(w.time, performance.now() / 1000); gl.uniform1f(w.velScale, H);
-  ensureMask(); bindTex(w.uMask, SOL.tex);
+  ensureMask(); bindTex(w.uMask, SOL.tex); gl.uniform3f(w.view, VIEW.cx, VIEW.cy, VIEW.s);
   const pd = paddleNow(); gl.uniform1f(w.paddleUV, pd ? pd.x / (canvas.width / canvas.height) : -1);
   blit(null);
 }
@@ -1498,8 +1509,57 @@ function maskSDF(u, v) {                           // bilinear, in screen height
   const i = Math.floor(x), j = Math.floor(y), tx = x - i, ty = y - j, k = j * w + i;
   return ((sdf[k] * (1 - tx) + sdf[k + 1] * tx) * (1 - ty) + (sdf[k + w] * (1 - tx) + sdf[k + w + 1] * tx) * ty) / h;
 }
+// ----- rogue wave ("vague scélérate") by dispersive focusing ----------------------------------------
+// Water waves are dispersive: long waves travel faster than short ones (w^2 = g k tanh(k h)). The wave maker sends
+// a chirped group, short waves first and long ones later, phased with linear theory so that every component
+// crests at the same place and time: the focus. There they add up to one wave far taller than the sea around it,
+// which then disperses again - the mechanism used to make rogue waves in laboratory flumes. A random background
+// sea runs all the time; a wave gauge at the focus measures H / Hs (a rogue wave is H > 2 Hs).
+const ROGUE = { on: false, comps: [], bg: [], x0: 0.06, xf: 0.5, P: 7, t0: 3, h: 0.2, A: 1, gauge: [], rest: 0, best: 0 };
+function waveK(w, g, h) {                        // solve the dispersion relation w^2 = g k tanh(k h) for k (Newton)
+  let k = Math.max(w * w / g, w / Math.sqrt(g * h));
+  for (let i = 0; i < 40; i++) { const t = Math.tanh(k * h), f = g * k * t - w * w, df = g * t + g * k * h * (1 - t * t); k -= f / df; }
+  return k;
+}
+function pistonGain(k, h) { const q = 2 * k * h; return 2 * (Math.cosh(q) - 1) / (Math.sinh(q) + q); }   // wave height / paddle stroke
+function rogueGeometry(A) {
+  const x0 = 0.06, xb = 0.72 * A, L = xb - x0, lam = Math.min(L / 2.8, 0.7);
+  return { x0, xb, L, lam, h: Math.min(0.35, Math.max(0.15, 0.5 * lam)) };
+}
+function setupRogue() {
+  const A = canvas.width / canvas.height, g = Math.max(1, cfg.gravity), G = rogueGeometry(A), h = G.h;
+  const kP = 2 * Math.PI / G.lam, wP = Math.sqrt(g * kP * Math.tanh(kP * h)), Af = cfg.rogueSteep / kP;
+  Object.assign(ROGUE, { A, h, x0: G.x0, xf: 0.62 * G.L, gauge: [], best: 0, comps: [], bg: [] });
+  const comp = (w, a) => { const k = waveK(w, g, h), q = 2 * k * h; return { w, k, a, X: a / pistonGain(k, h), cg: 0.5 * w / k * (1 + q / Math.sinh(q)) }; };
+  // the focused group: a Gaussian spectrum around the peak frequency, amplitudes summing to the focus amplitude
+  const N = 24; let sum = 0;
+  for (let n = 0; n < N; n++) { const r = 0.6 + n / (N - 1); const a = Math.exp(-(((r - 1) / 0.25) ** 2)); ROGUE.comps.push(comp(r * wP, a)); sum += a; }
+  ROGUE.comps.forEach(c => { c.a *= Af / sum; c.X *= Af / sum; });
+  // the background sea: random phases, significant wave height Hs = 0.8 x focus amplitude (so the focused wave is ~2.5 Hs)
+  const M = 12, Hs = 0.8 * Af * cfg.rogueSea; let e = 0;
+  for (let m = 0; m < M; m++) { const r = 0.7 + 0.9 * m / (M - 1), wgt = Math.exp(-(((r - 1) / 0.35) ** 2)); const c = comp(r * wP, wgt); c.p = Math.random() * 2 * Math.PI; ROGUE.bg.push(c); e += wgt * wgt; }
+  ROGUE.bg.forEach(c => { const sc = (Hs / 4) * Math.sqrt(2 / e); c.X *= sc; c.a *= sc; });
+  // keep the paddle stroke inside the tank
+  const stroke = ROGUE.comps.reduce((t, c) => t + c.X, 0) + ROGUE.bg.reduce((t, c) => t + c.X, 0);
+  if (stroke > 0.05) { const k = 0.05 / stroke; ROGUE.comps.forEach(c => c.X *= k); ROGUE.bg.forEach(c => c.X *= k); }
+  // timing: first focus once the slowest component has had time to arrive, then one every P seconds
+  const cgMin = Math.min(...ROGUE.comps.map(c => c.cg));
+  ROGUE.t0 = 1.5 + ROGUE.xf / cgMin; ROGUE.P = Math.max(7, 2.5 * ROGUE.xf / cgMin);
+}
+function rogueStroke(t) {                       // paddle displacement and speed (screen heights, from its mean position)
+  let x = 0, v = 0;
+  const e0 = Math.floor((t - ROGUE.t0) / ROGUE.P);
+  for (let e = Math.max(0, e0 - 1); e <= e0 + 2; e++) {       // only the focus events whose chirp can be active now
+    const tf = ROGUE.t0 + e * ROGUE.P;
+    for (const c of ROGUE.comps) { const ph = c.w * (t - tf) + c.k * ROGUE.xf; x += c.X * Math.sin(ph); v += c.X * c.w * Math.cos(ph); }
+  }
+  for (const c of ROGUE.bg) { const ph = c.w * t + c.p; x += c.X * Math.sin(ph); v += c.X * c.w * Math.cos(ph); }
+  const r = Math.min(1, t / 1.5), sm = r * r * (3 - 2 * r), dsm = t < 1.5 ? 6 * r * (1 - r) / 1.5 : 0;   // smooth start
+  return { x: x * sm, v: v * sm + x * dsm };
+}
 function paddleNow() {                             // wave maker plate: position (screen heights from the left wall) and speed
   if (!PADDLE.on) return null;
+  if (PADDLE.mode === 'rogue') { const r = rogueStroke(PADDLE.t); return { x: ROGUE.x0 + r.x, v: r.v }; }
   const w = 2 * Math.PI / cfg.paddlePeriod, t = PADDLE.t;
   return { x: 0.04 + cfg.paddleAmp * (1 - Math.cos(w * t)), v: cfg.paddleAmp * w * Math.sin(w * t) };   // starts at rest, smooth
 }
@@ -1516,6 +1576,9 @@ const SCENES = {
   wavepool: { label: 'Wave pool', sub: 'A piston wave maker sends waves up a sandy beach', paddle: true,
     water: (x, y) => y - 0.3,
     solids: (x, y, A) => (x > 0.5 * A && y < (x - 0.5 * A) / (0.5 * A) * 0.42) ? 2 : 0 },
+  rogue: { label: 'Rogue wave (vague scélérate)', sub: 'Waves focused by dispersion, as in a lab flume. Best in landscape, with APIC Pro', paddle: 'rogue',
+    water: (x, y, A) => y - rogueGeometry(A).h,
+    solids: (x, y, A) => { const G = rogueGeometry(A); return (x > G.xb && y < (x - G.xb) / (A - G.xb) * (G.h + 0.12)) ? 2 : 0; } },
   fountain: { label: 'Fountain', sub: 'A submerged pump drives a jet up through a pipe',
     water: (x, y) => y - 0.35,
     solids: (x, y, A) => { const d = Math.abs(x - 0.5 * A); return (d > 0.022 && d < 0.034 && y > 0.05 && y < 0.47) ? 5 : 0; },
@@ -1554,7 +1617,10 @@ function loadScene(name) {
   ensureMask(); SOL.mat.fill(0);
   if (S.solids) for (let j = 0; j < SOL.h; j++) for (let i = 0; i < SOL.w; i++) SOL.mat[j * SOL.w + i] = S.solids((i + 0.5) / SOL.h, (j + 0.5) / SOL.h, A);
   SOL.dirty = true;
-  PADDLE.on = !!S.paddle; PADDLE.t = 0; TAP.on = !!S.tap; scene.jet = S.jet ? S.jet(A) : null;
+  PADDLE.on = !!S.paddle; PADDLE.t = 0; PADDLE.mode = S.paddle === 'rogue' ? 'rogue' : 'sine'; TAP.on = !!S.tap; scene.jet = S.jet ? S.jet(A) : null;
+  ROGUE.on = PADDLE.mode === 'rogue';
+  if (ROGUE.on) setupRogue();
+  if (!ROGUE.on) { VIEW.cx = 0.5; VIEW.cy = 0.5; VIEW.s = 1; }
   applySceneWater();
   syncSceneButtons();
 }
@@ -1562,7 +1628,61 @@ function syncSceneButtons() {
   $('sceneBtn').textContent = 'Scene: ' + (SCENES[scene.name] || SCENES.tank).label;
   $('paddle').textContent = 'Wave maker: ' + (PADDLE.on ? 'on' : 'off');
   $('tap').textContent = 'Tap: ' + (TAP.on ? 'on' : 'off');
+  $('zoom').hidden = !ROGUE.on; $('zoom').textContent = 'Zoom: ' + (VIEW.s < 1 ? 'on' : 'off');
+  $('gauge').style.display = $('gaugeLine').style.display = ROGUE.on ? 'block' : 'none';
   $('tool').textContent = 'Tool: ' + { water: 'Water', wall: 'Draw wall', erase: 'Erase wall' }[tool];
+}
+// Wave gauge at the focus: water depth in that column (read back from the 128x128 volume texture), its history,
+// and the rogue-wave statistics: significant wave height Hs = 4 x std(elevation), largest zero-up-crossing wave Hmax.
+const gaugeBuf = new Float32Array(128 * 4);
+function gaugeSample() {
+  const u = (ROGUE.x0 + ROGUE.xf) / ROGUE.A, col = Math.min(127, Math.max(0, Math.floor(u * 128)));
+  texUnit = 0; use(P.massDown); bindTex(P.massDown.u.uTex, water.read); blit(massTex);
+  gl.bindFramebuffer(gl.FRAMEBUFFER, massTex.fbo);
+  try { gl.readPixels(col, 0, 1, 128, gl.RGBA, gl.FLOAT, gaugeBuf); } catch (_) { return; }
+  let d = 0; for (let i = 0; i < 128; i++) d += gaugeBuf[4 * i];
+  const depth = d / 128, t = PADDLE.t;
+  if (t < 1) ROGUE.rest = depth;                  // still-water level before the first waves arrive
+  ROGUE.gauge.push([t, depth - ROGUE.rest]);
+  while (ROGUE.gauge.length && ROGUE.gauge[0][0] < t - 24) ROGUE.gauge.shift();
+}
+function gaugeStats() {
+  const g = ROGUE.gauge.filter(p => p[0] > 2); if (g.length < 60) return null;
+  const m = g.reduce((s, p) => s + p[1], 0) / g.length, sd = Math.sqrt(g.reduce((s, p) => s + (p[1] - m) ** 2, 0) / g.length), Hs = 4 * sd;
+  let Hmax = 0, lo = Infinity, hi = -Infinity, started = false;
+  for (let i = 1; i < g.length; i++) {
+    const a = g[i - 1][1] - m, b = g[i][1] - m;
+    if (a < 0 && b >= 0) { if (started) Hmax = Math.max(Hmax, hi - lo); started = true; lo = Infinity; hi = -Infinity; }
+    lo = Math.min(lo, b); hi = Math.max(hi, b);
+  }
+  return { Hs, Hmax, ratio: Hs > 0 ? Hmax / Hs : 0 };
+}
+function drawGauge() {
+  const cv = $('gauge'), c = cv.getContext('2d'), W = cv.width, H = cv.height, g = ROGUE.gauge, t = PADDLE.t;
+  c.clearRect(0, 0, W, H);
+  const st = gaugeStats(), sc = (H * 0.32) / Math.max(0.004, ...g.map(p => Math.abs(p[1])));
+  c.strokeStyle = '#ffffff22'; c.beginPath(); c.moveTo(0, H * 0.6); c.lineTo(W, H * 0.6); c.stroke();
+  if (st) {                                       // the rogue threshold: crests above about 1.25 Hs
+    c.strokeStyle = '#ffd54a55'; c.setLineDash([6, 6]);
+    for (const y of [H * 0.6 - 1.25 * st.Hs * sc]) { c.beginPath(); c.moveTo(0, y); c.lineTo(W, y); c.stroke(); }
+    c.setLineDash([]);
+  }
+  c.strokeStyle = '#7fd4ff'; c.lineWidth = 3; c.beginPath();
+  g.forEach((p, i) => { const x = W - (t - p[0]) / 24 * W, y = H * 0.6 - p[1] * sc; i ? c.lineTo(x, y) : c.moveTo(x, y); });
+  c.stroke();
+  const next = ROGUE.t0 + Math.max(0, Math.ceil((t - ROGUE.t0) / ROGUE.P)) * ROGUE.P - t;
+  c.font = '600 22px system-ui'; c.fillStyle = '#fffd';
+  c.fillText('Wave gauge at the focus', 16, 32);
+  c.font = '20px system-ui'; c.fillStyle = '#fffa';
+  if (st) {
+    ROGUE.best = Math.max(ROGUE.best, st.ratio);
+    const rogue = st.ratio >= 2;
+    c.fillStyle = rogue ? '#ffd54a' : '#fffa';
+    c.fillText(`Hmax / Hs = ${st.ratio.toFixed(2)}${rogue ? '  ROGUE WAVE' : ''}`, 16, H - 18);
+  } else c.fillText('measuring the sea…', 16, H - 18);
+  c.fillStyle = '#fff8'; c.textAlign = 'right'; c.fillText(next < 3 ? 'focus now' : `next focus in ${next.toFixed(0)} s`, W - 14, 32); c.textAlign = 'left';
+  const u = (ROGUE.x0 + ROGUE.xf) / ROGUE.A, sx = ((u - VIEW.cx) / VIEW.s + 0.5) * 100;
+  $('gaugeLine').style.left = sx + '%';
 }
 function waterVolume() { return isParticles() ? FL.sim.np / (FL.sim.nx * FL.sim.ny * 3.2) : waterTarget; }
 
@@ -1592,7 +1712,7 @@ canvas.addEventListener('pointerdown', e => {
   e.preventDefault();
   try { canvas.setPointerCapture(e.pointerId); } catch (_) {}
   const r = canvas.getBoundingClientRect();
-  const x = (e.clientX - r.left) / r.width, y = 1 - (e.clientY - r.top) / r.height;
+  const x = VIEW.cx + ((e.clientX - r.left) / r.width - 0.5) * VIEW.s, y = VIEW.cy + (0.5 - (e.clientY - r.top) / r.height) * VIEW.s;
   const p = { x, y, dx: 0, dy: 0, moved: false, hold: null, draw: false };
   pointers.set(e.pointerId, p);
   $('scenes').classList.remove('open');
@@ -1606,7 +1726,7 @@ canvas.addEventListener('pointermove', e => {
   const p = pointers.get(e.pointerId); if (!p) return;
   e.preventDefault();
   const r = canvas.getBoundingClientRect();
-  const x = (e.clientX - r.left) / r.width, y = 1 - (e.clientY - r.top) / r.height;
+  const x = VIEW.cx + ((e.clientX - r.left) / r.width - 0.5) * VIEW.s, y = VIEW.cy + (0.5 - (e.clientY - r.top) / r.height) * VIEW.s;
   if (p.draw) {
     paintLine(p.x, p.y, x, y, tool === 'erase' ? cfg.wallSize * 2 : cfg.wallSize, tool === 'erase' ? 0 : 1);
     p.x = x; p.y = y; return;
@@ -1667,7 +1787,12 @@ if ('DeviceMotionEvent' in window && matchMedia('(pointer: coarse)').matches) {
 }
 $('clear').onclick = () => loadScene(scene.name);
 $('tool').onclick = () => { tool = { water: 'wall', wall: 'erase', erase: 'water' }[tool]; syncSceneButtons(); };
-$('paddle').onclick = () => { PADDLE.on = !PADDLE.on; PADDLE.t = 0; syncSceneButtons(); };
+$('paddle').onclick = () => { PADDLE.on = !PADDLE.on; PADDLE.t = 0; if (!PADDLE.on) PADDLE.mode = 'sine'; ROGUE.on = PADDLE.on && PADDLE.mode === 'rogue'; syncSceneButtons(); };
+$('zoom').onclick = () => {                         // zoom on the focus point, at the water surface
+  if (VIEW.s < 1) { VIEW.cx = 0.5; VIEW.cy = 0.5; VIEW.s = 1; }
+  else { VIEW.s = 0.42; VIEW.cx = Math.min(1 - VIEW.s / 2, Math.max(VIEW.s / 2, (ROGUE.x0 + ROGUE.xf) / ROGUE.A)); VIEW.cy = Math.min(1 - VIEW.s / 2, Math.max(VIEW.s / 2, ROGUE.h + 0.04)); }
+  syncSceneButtons();
+};
 $('tap').onclick = () => { TAP.on = !TAP.on; syncSceneButtons(); };
 {
   const box = $('scenes');
@@ -1694,6 +1819,9 @@ const SCHEMA = [
   { k: 'tiltStrength', label: 'Tilt gravity strength', min: 0, max: 5, step: 0.1 },
   { k: 'paddleAmp', label: 'Wave maker stroke', min: 0.005, max: 0.06, step: 0.005, hint: 'Half the piston travel, in screen heights. Bigger = taller waves.' },
   { k: 'paddlePeriod', label: 'Wave maker period (s)', min: 0.15, max: 2, step: 0.05, hint: 'Short periods make short, steep waves; long periods make the tank slosh.' },
+  { k: 'rogueSteep', label: 'Rogue wave steepness', min: 0.05, max: 0.4, step: 0.01,
+    hint: 'Focus amplitude x wavenumber. Above about 0.3 the focused wave breaks. Applies on Reset.' },
+  { k: 'rogueSea', label: 'Rogue wave: background sea', min: 0, max: 2, step: 0.05, hint: 'Strength of the random sea around the rogue wave. Applies on Reset.' },
   { k: 'jetSpeed', label: 'Fountain pump speed', min: 1, max: 8, step: 0.25 },
   { k: 'tapSpeed', label: 'Tap flow speed', min: 0.5, max: 4, step: 0.1 },
   { k: 'wallSize', label: 'Wall brush size', min: 0.006, max: 0.05, step: 0.002 },
@@ -1704,7 +1832,7 @@ const SCHEMA = [
   { k: 'maxDpr', label: 'Render scale', min: 0.5, max: 3, step: 0.25, apply: () => { resizeCanvas(); initBuffers(); } },
 ];
 const DEFAULTS = Object.assign({}, cfg);
-const KEY = 'fluidCfg10';
+const KEY = 'fluidCfg11';
 try { const saved = JSON.parse(localStorage.getItem(KEY) || '{}'); for (const k in saved) if (k in DEFAULTS) cfg[k] = saved[k]; } catch (_) {}
 resizeCanvas(); initBuffers();
 const save = () => { try { localStorage.setItem(KEY, JSON.stringify(cfg)); } catch (_) {} };
@@ -2076,6 +2204,7 @@ function frame(now) {
   updateGravity(dt); applyPointers(dt);
   if (isParticles()) stepFlip(dt); else stepWater(dt);
   render();
+  if (ROGUE.on && PADDLE.on) { gaugeSample(); drawGauge(); }
   if (raw < 0.5) adapt(raw);              // ignore tab-switch hiccups
   requestAnimationFrame(frame);
 }
