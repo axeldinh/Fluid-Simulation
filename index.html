@@ -1533,26 +1533,35 @@ function setupRogue() {
   Object.assign(ROGUE, { A, h, x0: G.x0, xf: 0.62 * G.L, gauge: [], best: 0, comps: [], bg: [] });
   const comp = (w, a) => { const k = waveK(w, g, h), q = 2 * k * h; return { w, k, a, X: a / pistonGain(k, h), cg: 0.5 * w / k * (1 + q / Math.sinh(q)) }; };
   // the focused group: a Gaussian spectrum around the peak frequency, amplitudes summing to the focus amplitude
-  const N = 24; let sum = 0;
-  for (let n = 0; n < N; n++) { const r = 0.6 + n / (N - 1); const a = Math.exp(-(((r - 1) / 0.25) ** 2)); ROGUE.comps.push(comp(r * wP, a)); sum += a; }
+  const N = 32; let sum = 0;
+  for (let n = 0; n < N; n++) { const r = 0.5 + 1.4 * n / (N - 1); const a = Math.exp(-(((r - 1) / 0.35) ** 2)); ROGUE.comps.push(comp(r * wP, a)); sum += a; }
   ROGUE.comps.forEach(c => { c.a *= Af / sum; c.X *= Af / sum; });
-  // the background sea: random phases, significant wave height Hs = 0.8 x focus amplitude (so the focused wave is ~2.5 Hs)
-  const M = 12, Hs = 0.8 * Af * cfg.rogueSea; let e = 0;
+  // the background sea: random phases; its significant wave height is set so the focused wave stands > 2 Hs above it
+  const M = 12, Hs = 0.6 * Af * cfg.rogueSea; let e = 0;
   for (let m = 0; m < M; m++) { const r = 0.7 + 0.9 * m / (M - 1), wgt = Math.exp(-(((r - 1) / 0.35) ** 2)); const c = comp(r * wP, wgt); c.p = Math.random() * 2 * Math.PI; ROGUE.bg.push(c); e += wgt * wgt; }
   ROGUE.bg.forEach(c => { const sc = (Hs / 4) * Math.sqrt(2 / e); c.X *= sc; c.a *= sc; });
   // keep the paddle stroke inside the tank
   const stroke = ROGUE.comps.reduce((t, c) => t + c.X, 0) + ROGUE.bg.reduce((t, c) => t + c.X, 0);
   if (stroke > 0.05) { const k = 0.05 / stroke; ROGUE.comps.forEach(c => c.X *= k); ROGUE.bg.forEach(c => c.X *= k); }
-  // timing: first focus once the slowest component has had time to arrive, then one every P seconds
-  const cgMin = Math.min(...ROGUE.comps.map(c => c.cg));
-  ROGUE.t0 = 1.5 + ROGUE.xf / cgMin; ROGUE.P = Math.max(7, 2.5 * ROGUE.xf / cgMin);
+  // timing: first focus once the slowest component has had time to arrive, then one every P seconds. Rogue waves
+  // are rare: between events there is only the ordinary sea.
+  const cgMin = Math.min(...ROGUE.comps.map(c => c.cg)), cgMax = Math.max(...ROGUE.comps.map(c => c.cg));
+  ROGUE.ts = ROGUE.xf / cgMin + 1.2; ROGUE.te = ROGUE.xf / cgMax - 1.2;     // the paddle plays an event from tf - ts to tf - te
+  ROGUE.t0 = 1.6 + ROGUE.ts; ROGUE.P = Math.max(15, ROGUE.ts + 6);   // first event after the paddle's start-up ramp
 }
 function rogueStroke(t) {                       // paddle displacement and speed (screen heights, from its mean position)
   let x = 0, v = 0;
   const e0 = Math.floor((t - ROGUE.t0) / ROGUE.P);
   for (let e = Math.max(0, e0 - 1); e <= e0 + 2; e++) {       // only the focus events whose chirp can be active now
-    const tf = ROGUE.t0 + e * ROGUE.P;
-    for (const c of ROGUE.comps) { const ph = c.w * (t - tf) + c.k * ROGUE.xf; x += c.X * Math.sin(ph); v += c.X * c.w * Math.cos(ph); }
+    const tf = ROGUE.t0 + e * ROGUE.P, a = tf - ROGUE.ts, b = tf - ROGUE.te;
+    if (t <= a || t >= b) continue;
+    // a finite paddle signal (smooth 1 s ramps): without it the evenly spaced components would re-focus by themselves
+    const ra = Math.min(1, (t - a) / 1.0), rb = Math.min(1, (b - t) / 1.0);
+    const W = ra * ra * (3 - 2 * ra) * rb * rb * (3 - 2 * rb);
+    const dW = (t - a < 1 ? 6 * ra * (1 - ra) : 0) * rb * rb * (3 - 2 * rb) - (b - t < 1 ? 6 * rb * (1 - rb) : 0) * ra * ra * (3 - 2 * ra);
+    let xe = 0, ve = 0;
+    for (const c of ROGUE.comps) { const ph = c.w * (t - tf) + c.k * ROGUE.xf; xe += c.X * Math.sin(ph); ve += c.X * c.w * Math.cos(ph); }
+    x += xe * W; v += ve * W + xe * dW;
   }
   for (const c of ROGUE.bg) { const ph = c.w * t + c.p; x += c.X * Math.sin(ph); v += c.X * c.w * Math.cos(ph); }
   const r = Math.min(1, t / 1.5), sm = r * r * (3 - 2 * r), dsm = t < 1.5 ? 6 * r * (1 - r) / 1.5 : 0;   // smooth start
@@ -1645,7 +1654,7 @@ function gaugeSample() {
   const depth = d / 128, t = PADDLE.t;
   if (t < 1) ROGUE.rest = depth;                  // still-water level before the first waves arrive
   ROGUE.gauge.push([t, depth - ROGUE.rest]);
-  while (ROGUE.gauge.length && ROGUE.gauge[0][0] < t - 24) ROGUE.gauge.shift();
+  while (ROGUE.gauge.length && ROGUE.gauge[0][0] < t - 45) ROGUE.gauge.shift();
 }
 function gaugeStats() {
   const g = ROGUE.gauge.filter(p => p[0] > 2); if (g.length < 60) return null;
@@ -1669,7 +1678,7 @@ function drawGauge() {
     c.setLineDash([]);
   }
   c.strokeStyle = '#7fd4ff'; c.lineWidth = 3; c.beginPath();
-  g.forEach((p, i) => { const x = W - (t - p[0]) / 24 * W, y = H * 0.6 - p[1] * sc; i ? c.lineTo(x, y) : c.moveTo(x, y); });
+  g.forEach((p, i) => { const x = W - (t - p[0]) / 45 * W, y = H * 0.6 - p[1] * sc; i ? c.lineTo(x, y) : c.moveTo(x, y); });
   c.stroke();
   const next = ROGUE.t0 + Math.max(0, Math.ceil((t - ROGUE.t0) / ROGUE.P)) * ROGUE.P - t;
   c.font = '600 22px system-ui'; c.fillStyle = '#fffd';
