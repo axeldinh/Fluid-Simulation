@@ -1252,7 +1252,8 @@ function fillFlip() { FL.sim.fill(FILL_LEVEL); }
 
 function stepFlip(dt) {
   const f = FL.sim, nx = f.nx, ny = f.ny, gm = cfg.gravity * ny * (tilt.on ? cfg.tiltStrength : 1);
-  f.damp = cfg.velocityDissipation;
+  f.damp = dampingNow();
+  f.sleep = (ROGUE.on ? 0.01 : f instanceof Apic ? 0.02 : 0.05) * ny;   // keep gentle background waves alive in the rogue scene
   const pd = paddleNow();
   f.paddleX = pd ? 1 + pd.x * ny : -1; f.paddleU = pd ? pd.v * ny : 0;
   const jb = scene.jet;
@@ -1318,7 +1319,7 @@ function stepWater(dt) {
   // advect the face velocities (both read the old fields, then swap)
   for (const kind of [0, 1]) {
     texUnit = 0; u = use(P.advectFaces); bindTex(u.uU, WS.U.read); bindTex(u.uV, WS.V.read);
-    gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, dt); gl.uniform1f(u.damp, cfg.velocityDissipation); gl.uniform1f(u.kind, kind);
+    gl.uniform2f(u.gridSize, W, H); gl.uniform1f(u.dt, dt); gl.uniform1f(u.damp, dampingNow()); gl.uniform1f(u.kind, kind);
     blit(kind ? WS.V.write : WS.U.write);
   }
   WS.U.swap(); WS.V.swap();
@@ -1684,6 +1685,9 @@ function drawGauge() {
   const u = (ROGUE.x0 + ROGUE.xf) / ROGUE.A, sx = ((u - VIEW.cx) / VIEW.s + 0.5) * 100;
   $('gaugeLine').style.left = sx + '%';
 }
+// velocity damping in use: the settle-down damping from Settings, except in the rogue-wave scene, where waves must
+// travel the flume (real water's viscosity is negligible at this scale)
+function dampingNow() { return ROGUE.on ? 0.02 : cfg.velocityDissipation; }
 function waterVolume() { return isParticles() ? FL.sim.np / (FL.sim.nx * FL.sim.ny * 3.2) : waterTarget; }
 
 // ----- splats / input ------------------------------------------------------
